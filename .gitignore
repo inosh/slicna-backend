@@ -1,0 +1,8 @@
+node_modules/
+.env
+.env-prod
+uploads/*
+!uploads/.gitkeep
+private-uploads/
+.idea
+db/backups/

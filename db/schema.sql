@@ -1,0 +1,433 @@
+-- ============================================================
+-- SLICNA backend - database schema
+-- Run once against an empty database:  npm run init-db
+-- (or paste into pgAdmin's Query Tool for slicna_db).
+-- Every statement is IF NOT EXISTS, so re-running is safe.
+-- ============================================================
+
+-- Table: public.users
+-- Staff accounts for the admin panel. Create with: npm run create-admin
+
+CREATE TABLE IF NOT EXISTS public.users
+(
+    id serial NOT NULL,
+    username character varying(50) NOT NULL,
+    password_hash character varying(255) NOT NULL,
+    role character varying(30) NOT NULL DEFAULT 'Administrator',
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT users_pkey PRIMARY KEY (id),
+    CONSTRAINT users_username_key UNIQUE (username)
+);
+
+-- Table: public.site_settings
+-- Small key/value store for one-off page content, e.g. the About page's
+-- "Our journey" photo (key: about_journey_photo, value: /uploads/... path).
+
+CREATE TABLE IF NOT EXISTS public.site_settings
+(
+    key character varying(80) NOT NULL,
+    value text,
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT site_settings_pkey PRIMARY KEY (key)
+);
+
+-- Table: public.milestones
+-- About page "Achievements and milestones" timeline. year_label is free text
+-- so it can be a year ("2022") or a word ("Global", "Award").
+
+CREATE TABLE IF NOT EXISTS public.milestones
+(
+    id serial NOT NULL,
+    year_label character varying(40) NOT NULL,
+    title character varying(200) NOT NULL,
+    description text,
+    display_order integer NOT NULL DEFAULT 0,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT milestones_pkey PRIMARY KEY (id)
+);
+
+-- Table: public.committee_settings
+-- Singleton row (id always 1): the Executive Committee's term and election date.
+
+CREATE TABLE IF NOT EXISTS public.committee_settings
+(
+    id integer NOT NULL DEFAULT 1,
+    term_start_year integer NOT NULL,
+    term_end_year integer NOT NULL,
+    elected_on date,
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT committee_settings_pkey PRIMARY KEY (id),
+    CONSTRAINT committee_settings_singleton_check CHECK (id = 1),
+    CONSTRAINT committee_settings_term_check CHECK (term_end_year >= term_start_year)
+);
+
+-- Table: public.committee_members
+-- Executive Committee members, shown on the Leadership page in display_order.
+-- Unlike SLNA's fixed seats, members can be added and removed freely.
+
+CREATE TABLE IF NOT EXISTS public.committee_members
+(
+    id serial NOT NULL,
+    display_order integer NOT NULL DEFAULT 0,
+    role_title character varying(100) NOT NULL,
+    name character varying(255) NOT NULL,
+    designation character varying(150),
+    photo_url character varying(500),
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT committee_members_pkey PRIMARY KEY (id)
+);
+
+-- Table: public.events
+-- All events: accredited CPD programmes, international workshops and
+-- community events. The CPD page lists events that have cpd_points and
+-- totals them; the Events page lists everything.
+
+CREATE TABLE IF NOT EXISTS public.events
+(
+    id serial NOT NULL,
+    title character varying(300) NOT NULL,
+    category character varying(20) NOT NULL DEFAULT 'cpd',
+    event_date date NOT NULL,
+    end_date date,
+    time_text character varying(100),
+    location character varying(300),
+    summary text,
+    body text,
+    cpd_points numeric(5,2),
+    photo_url character varying(500),
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT events_pkey PRIMARY KEY (id),
+    CONSTRAINT events_category_check CHECK (category IN ('cpd', 'international', 'community')),
+    CONSTRAINT events_end_date_check CHECK (end_date IS NULL OR end_date >= event_date),
+    CONSTRAINT events_cpd_points_check CHECK (cpd_points IS NULL OR cpd_points >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS events_event_date_idx ON public.events (event_date);
+
+-- Table: public.news
+-- News articles. body is plain text; blank lines separate paragraphs.
+
+CREATE TABLE IF NOT EXISTS public.news
+(
+    id serial NOT NULL,
+    title character varying(300) NOT NULL,
+    summary text,
+    body text,
+    photo_url character varying(500),
+    published_at date NOT NULL DEFAULT CURRENT_DATE,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT news_pkey PRIMARY KEY (id)
+);
+
+CREATE INDEX IF NOT EXISTS news_published_at_idx ON public.news (published_at DESC);
+
+-- Table: public.albums / public.album_photos
+-- Gallery albums and their photos. Deleting an album deletes its photos.
+
+CREATE TABLE IF NOT EXISTS public.albums
+(
+    id serial NOT NULL,
+    title character varying(200) NOT NULL,
+    description text,
+    event_date date,
+    display_order integer NOT NULL DEFAULT 0,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT albums_pkey PRIMARY KEY (id)
+);
+
+CREATE TABLE IF NOT EXISTS public.album_photos
+(
+    id serial NOT NULL,
+    album_id integer NOT NULL,
+    url character varying(500) NOT NULL,
+    caption character varying(300),
+    display_order integer NOT NULL DEFAULT 0,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT album_photos_pkey PRIMARY KEY (id),
+    CONSTRAINT album_photos_album_id_fkey FOREIGN KEY (album_id)
+        REFERENCES public.albums (id) ON DELETE CASCADE
+);
+
+-- Table: public.community_sections / public.community_items
+-- The Community page is a list of sections, each drawn in one of three styles:
+--   feature   - light section with logo, text, bullet points and a photo grid
+--   highlight - dark band with one photo beside the text
+--   cards     - heading plus a grid of cards (photo, label, title, text)
+-- Items are the photos (feature/highlight) or cards (cards) of a section.
+
+CREATE TABLE IF NOT EXISTS public.community_sections
+(
+    id serial NOT NULL,
+    display_order integer NOT NULL DEFAULT 0,
+    style character varying(20) NOT NULL DEFAULT 'feature',
+    eyebrow character varying(100),
+    title character varying(200) NOT NULL,
+    body text,
+    bullet_points text,
+    logo_url character varying(500),
+    link_text character varying(100),
+    link_url character varying(300),
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT community_sections_pkey PRIMARY KEY (id),
+    CONSTRAINT community_sections_style_check CHECK (style IN ('feature', 'highlight', 'cards'))
+);
+
+CREATE TABLE IF NOT EXISTS public.community_items
+(
+    id serial NOT NULL,
+    section_id integer NOT NULL,
+    display_order integer NOT NULL DEFAULT 0,
+    image_url character varying(500),
+    label character varying(100),
+    title character varying(200),
+    text text,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT community_items_pkey PRIMARY KEY (id),
+    CONSTRAINT community_items_section_id_fkey FOREIGN KEY (section_id)
+        REFERENCES public.community_sections (id) ON DELETE CASCADE
+);
+
+-- ============================================================
+-- Membership
+-- Categories: LT (Lifetime), GM (General), OM (Ordinary), PM (Partial).
+-- LT never expires; the others are valid for 12 months at a time.
+-- Uploaded documents (photo, payment slip, signed recommendation page) are
+-- PRIVATE: they live in private-uploads/ (later an R2 private bucket) under
+-- keys like "membership/applications/<ref>/photo-....jpg", are never served
+-- statically, and are only streamed to logged-in admins.
+-- ============================================================
+
+-- Table: public.membership_fees
+-- One row per category; the amount is editable in the admin panel.
+
+CREATE TABLE IF NOT EXISTS public.membership_fees
+(
+    category character varying(2) NOT NULL,
+    label character varying(60) NOT NULL,
+    amount numeric(10,2) NOT NULL,
+    is_annual boolean NOT NULL,
+    display_order integer NOT NULL DEFAULT 0,
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT membership_fees_pkey PRIMARY KEY (category),
+    CONSTRAINT membership_fees_category_check CHECK (category IN ('LT', 'GM', 'OM', 'PM')),
+    CONSTRAINT membership_fees_amount_check CHECK (amount >= 0)
+);
+
+INSERT INTO public.membership_fees (category, label, amount, is_annual, display_order) VALUES
+    ('LT', 'Lifetime Membership', 3000, false, 10),
+    ('GM', 'General Membership', 1000, true, 20),
+    ('OM', 'Ordinary Membership', 500, true, 30),
+    ('PM', 'Partial Membership', 1000, true, 40)
+ON CONFLICT (category) DO NOTHING;
+
+-- Membership settings live in site_settings (editable in the admin panel).
+INSERT INTO public.site_settings (key, value) VALUES
+    ('bank_name', 'Bank of Ceylon'),
+    ('bank_account_number', '89766252'),
+    ('bank_branch', 'Regent Street, Colombo'),
+    ('bank_account_name', 'Sri Lanka Intensive Care Nurses Association'),
+    ('membership_grace_days', '30'),
+    ('membership_notice_days', '30')
+ON CONFLICT (key) DO NOTHING;
+
+-- Table: public.membership_applications
+-- Online applications. status flow:
+--   pending -> under_review -> (more_info_required <-> under_review) -> approved | rejected
+-- status_note is shown to the applicant on the status page; admin_notes is internal.
+
+CREATE TABLE IF NOT EXISTS public.membership_applications
+(
+    id serial NOT NULL,
+    reference_number character varying(20) NOT NULL,
+    category character varying(2) NOT NULL,
+    status character varying(30) NOT NULL DEFAULT 'pending',
+    status_note text,
+    admin_notes text,
+
+    title character varying(10),
+    full_name character varying(255) NOT NULL,
+    name_with_initials character varying(255) NOT NULL,
+    nic_number character varying(20) NOT NULL,
+    date_of_birth date,
+    sex character varying(10),
+    marital_status character varying(20),
+    slnc_number character varying(50),
+    slnc_date date,
+    slna_number character varying(50),
+    slna_date date,
+    permanent_address text,
+    current_working_place character varying(255),
+    official_address text,
+    designation character varying(255),
+    mobile character varying(30) NOT NULL,
+    whatsapp character varying(30),
+    residential_phone character varying(30),
+    office_phone character varying(30),
+    email character varying(255) NOT NULL,
+    nursing_school character varying(255),
+    batch character varying(50),
+    first_appointment_date date,
+    first_appointment_place character varying(255),
+    icu_training_batch character varying(50),
+    icu_training_type character varying(20),
+    icu_training_year integer,
+    student_number character varying(50),
+    institute_registration_date date,
+    higher_qualifications text,
+    -- Ticked "I don't have my SLNC / SLNA number yet" (the number and date are then empty).
+    slnc_not_registered boolean NOT NULL DEFAULT false,
+    slna_not_member boolean NOT NULL DEFAULT false,
+
+    -- GM/OM: the recommending Lifetime member. PM: the certifying institution
+    -- officer (endorser_workplace = institution, endorser_designation = title).
+    endorser_name character varying(255),
+    endorser_membership_number character varying(30),
+    endorser_contact character varying(30),
+    endorser_workplace character varying(255),
+    endorser_designation character varying(100),
+
+    photo_key character varying(500),
+    receipt_key character varying(500),
+    endorsement_key character varying(500),
+    payment_amount numeric(10,2),
+    payment_date date,
+    declaration_confirmed boolean NOT NULL DEFAULT false,
+
+    reviewed_by integer,
+    reviewed_at timestamp with time zone,
+    approved_at timestamp with time zone,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT membership_applications_pkey PRIMARY KEY (id),
+    CONSTRAINT membership_applications_reference_key UNIQUE (reference_number),
+    CONSTRAINT membership_applications_category_check CHECK (category IN ('LT', 'GM', 'OM', 'PM')),
+    CONSTRAINT membership_applications_status_check CHECK (status IN ('pending', 'under_review', 'more_info_required', 'approved', 'rejected'))
+);
+
+CREATE INDEX IF NOT EXISTS membership_applications_status_idx ON public.membership_applications (status, created_at DESC);
+
+-- Table: public.members
+-- Approved members (from an application) and members added by an admin.
+-- valid_until is NULL for Lifetime members. is_active = false means an admin
+-- deactivated the member; "renewal due / grace / lapsed" are worked out from
+-- valid_until and the grace setting, so lapsing happens automatically.
+
+CREATE TABLE IF NOT EXISTS public.members
+(
+    id serial NOT NULL,
+    membership_number character varying(30) NOT NULL,
+    category character varying(2) NOT NULL,
+    title character varying(10),
+    full_name character varying(255) NOT NULL,
+    name_with_initials character varying(255) NOT NULL,
+    nic_number character varying(20) NOT NULL,
+    date_of_birth date,
+    sex character varying(10),
+    email character varying(255),
+    mobile character varying(30),
+    whatsapp character varying(30),
+    current_working_place character varying(255),
+    designation character varying(255),
+    joined_on date NOT NULL,
+    valid_until date,
+    is_active boolean NOT NULL DEFAULT true,
+    deactivated_reason text,
+    deactivated_at timestamp with time zone,
+    photo_key character varying(500),
+    application_id integer,
+    source character varying(20) NOT NULL DEFAULT 'application',
+    admin_notes text,
+    id_application_created_at timestamp with time zone,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT members_pkey PRIMARY KEY (id),
+    CONSTRAINT members_membership_number_key UNIQUE (membership_number),
+    CONSTRAINT members_application_id_key UNIQUE (application_id),
+    CONSTRAINT members_application_id_fkey FOREIGN KEY (application_id)
+        REFERENCES public.membership_applications (id) ON DELETE SET NULL,
+    CONSTRAINT members_category_check CHECK (category IN ('LT', 'GM', 'OM', 'PM')),
+    CONSTRAINT members_source_check CHECK (source IN ('application', 'manual')),
+    CONSTRAINT members_valid_until_check CHECK ((category = 'LT') = (valid_until IS NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS members_nic_key ON public.members (upper(nic_number));
+
+-- Table: public.renewal_requests
+-- Renewals and upgrades (e.g. GM -> LT) submitted by members through their
+-- renewal link, plus payments an admin records directly (recorded_by_admin).
+-- Contact details the member corrected are applied when it is verified.
+
+CREATE TABLE IF NOT EXISTS public.renewal_requests
+(
+    id serial NOT NULL,
+    member_id integer NOT NULL,
+    kind character varying(10) NOT NULL DEFAULT 'renewal',
+    from_category character varying(2) NOT NULL,
+    to_category character varying(2) NOT NULL,
+    amount numeric(10,2) NOT NULL,
+    payment_reference character varying(60) NOT NULL,
+    payment_date date,
+    receipt_key character varying(500),
+    status character varying(20) NOT NULL DEFAULT 'pending',
+    status_note text,
+    email character varying(255),
+    mobile character varying(30),
+    current_working_place character varying(255),
+    previous_valid_until date,
+    new_valid_until date,
+    recorded_by_admin boolean NOT NULL DEFAULT false,
+    reviewed_by integer,
+    reviewed_at timestamp with time zone,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT renewal_requests_pkey PRIMARY KEY (id),
+    CONSTRAINT renewal_requests_member_id_fkey FOREIGN KEY (member_id)
+        REFERENCES public.members (id) ON DELETE CASCADE,
+    CONSTRAINT renewal_requests_kind_check CHECK (kind IN ('renewal', 'upgrade')),
+    CONSTRAINT renewal_requests_status_check CHECK (status IN ('pending', 'verified', 'rejected'))
+);
+
+CREATE INDEX IF NOT EXISTS renewal_requests_status_idx ON public.renewal_requests (status, created_at DESC);
+
+-- Table: public.renewal_tokens
+-- Personal renewal links. Only a SHA-256 hash of the token is stored.
+
+CREATE TABLE IF NOT EXISTS public.renewal_tokens
+(
+    id serial NOT NULL,
+    member_id integer NOT NULL,
+    token_hash character(64) NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT renewal_tokens_pkey PRIMARY KEY (id),
+    CONSTRAINT renewal_tokens_token_hash_key UNIQUE (token_hash),
+    CONSTRAINT renewal_tokens_member_id_fkey FOREIGN KEY (member_id)
+        REFERENCES public.members (id) ON DELETE CASCADE
+);
+
+-- Table: public.reminder_log
+-- Every renewal reminder the daily job tried to send. A reminder kind is sent
+-- once per membership period (period_key = valid_until at the time).
+
+CREATE TABLE IF NOT EXISTS public.reminder_log
+(
+    id serial NOT NULL,
+    member_id integer NOT NULL,
+    kind character varying(30) NOT NULL,
+    period_key date NOT NULL,
+    status character varying(10) NOT NULL,
+    detail text,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT reminder_log_pkey PRIMARY KEY (id),
+    CONSTRAINT reminder_log_member_id_fkey FOREIGN KEY (member_id)
+        REFERENCES public.members (id) ON DELETE CASCADE,
+    CONSTRAINT reminder_log_status_check CHECK (status IN ('sent', 'skipped', 'failed'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS reminder_log_sent_once ON public.reminder_log (member_id, kind, period_key) WHERE status = 'sent';
