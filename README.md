@@ -43,6 +43,7 @@ Reads are public; everything else needs `Authorization: Bearer <token>` from `PO
 |---|---|---|
 | Auth | `POST /api/auth/login`, `POST /api/auth/change-password` | |
 | News | `GET/POST /api/news`, `GET/PUT/DELETE /api/news/:id` | `photo` |
+| Journal | `GET/POST /api/journals`, `GET/PUT/DELETE /api/journals/:id` (newest first). Upload `pdf` (required when adding, up to 30MB) and an optional `cover` image; the Journal page shows the newest issue as a flipbook | `cover` |
 | Events (public) | `GET /api/events`, `GET /api/events/:id` (see Events below) | |
 | Milestones (About page) | `GET/POST /api/milestones`, `GET/PUT/DELETE /api/milestones/:id` | |
 | Settings | `GET /api/settings`, `PUT /api/settings/images/about_journey_photo` | `photo` |

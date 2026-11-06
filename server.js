@@ -11,6 +11,7 @@ require('dotenv').config();
 
 const authRoutes = require('./routes/auth');
 const newsRoutes = require('./routes/news');
+const journalsRoutes = require('./routes/journals');
 const eventsRoutes = require('./routes/events');
 const eventsAdminRoutes = require('./routes/events-admin');
 const milestonesRoutes = require('./routes/milestones');
@@ -57,6 +58,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads'), { maxAge: '7
 // --- Routes ---
 app.use('/api/auth', authRoutes);
 app.use('/api/news', newsRoutes);
+app.use('/api/journals', journalsRoutes);
 app.use('/api/events/admin', eventsAdminRoutes);
 app.use('/api/events', eventsRoutes);
 app.use('/api/milestones', milestonesRoutes);
@@ -80,7 +82,7 @@ app.use('/api', (req, res) => {
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
     if (err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ error: 'That file is too large. Photos must be under 15MB, and membership documents under 10MB.' });
+      return res.status(400).json({ error: 'That file is too large. Photos must be under 15MB, journal PDFs under 30MB, and membership documents under 10MB.' });
     }
     if (err.code === 'LIMIT_UNEXPECTED_FILE') {
       return res.status(400).json({ error: 'Too many files selected, or an unexpected file field was used.' });

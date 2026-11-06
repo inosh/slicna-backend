@@ -188,6 +188,29 @@ CREATE TABLE IF NOT EXISTS public.news
 
 CREATE INDEX IF NOT EXISTS news_published_at_idx ON public.news (published_at DESC);
 
+-- Table: public.journals
+-- SLICNA journal issues. The PDF (and an optional cover image) are public
+-- files in uploads/journals/; the Journal page shows the latest issue as a
+-- flipbook and the others as past issues.
+
+CREATE TABLE IF NOT EXISTS public.journals
+(
+    id serial NOT NULL,
+    title character varying(300) NOT NULL,
+    issue_label character varying(100),
+    published_on date NOT NULL DEFAULT CURRENT_DATE,
+    description text,
+    pdf_url character varying(500) NOT NULL,
+    pdf_name character varying(255),
+    pdf_size integer,
+    cover_url character varying(500),
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT journals_pkey PRIMARY KEY (id)
+);
+
+CREATE INDEX IF NOT EXISTS journals_published_on_idx ON public.journals (published_on DESC);
+
 -- Table: public.albums / public.album_photos
 -- Gallery albums and their photos. Deleting an album deletes its photos.
 
