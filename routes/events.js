@@ -2,7 +2,7 @@
 // Public event endpoints (no login):
 //   GET  /api/events                         all events (CPD and other), oldest first
 //   GET  /api/events/:id                     one event, with bank details for paid events
-//   POST /api/events/:id/member-check        membership number + NIC -> the member's fee
+//   POST /api/events/:id/member-check        membership number -> the member's category and fee
 //   POST /api/events/:id/registrations       register for a CPD event (multipart, receipt)
 // Adding and editing events is in routes/events-admin.js.
 
@@ -52,15 +52,18 @@ router.get('/:id', async (req, res, next) => {
 // ---------- Members ----------
 
 // The member with this number and NIC, or null.
-async function findMember(number, nic) {
+// Members are identified by membership number alone: records of members who
+// joined before the website have no NIC, and some aren't in the register yet.
+async function findMember(number) {
   const compact = M.compactNumber(number);
-  const nicValue = M.normaliseNic(nic);
-  if (!compact || !nicValue) return null;
+  if (!compact) return null;
   return (await pool.query(
-    "SELECT * FROM members WHERE regexp_replace(upper(membership_number), '[^A-Z0-9]', '', 'g') = $1 AND upper(nic_number) = $2",
-    [compact, nicValue]
+    "SELECT * FROM members WHERE regexp_replace(upper(membership_number), '[^A-Z0-9]', '', 'g') = $1",
+    [compact]
   )).rows[0] || null;
 }
+
+const NUMBER_FORMAT = 'Please enter your membership number like GM 0012/25 (LT, GM, OM or PM, the number and the year).';
 
 // What a member pays for this event, or why they can't use the member rate.
 async function memberQuote(event, member) {
@@ -74,10 +77,10 @@ async function memberQuote(event, member) {
     message = `This membership is not active. Please contact SLICNA${nonMembersAllowed ? ', or register as a non-member' : ''}.`;
   }
   return {
+    found: true,
     eligible,
     state,
     message,
-    name_with_initials: member.name_with_initials,
     membership_number: member.membership_number,
     category: member.category,
     category_label: M.CATEGORIES[member.category],
@@ -89,9 +92,20 @@ router.post('/:id/member-check', lookupLimiter, async (req, res, next) => {
   try {
     const event = await getEvent(parseId(req.params.id));
     if (!event || event.category !== 'cpd') return res.status(404).json({ error: 'Event not found.' });
-    const member = await findMember(req.body.membership_number, req.body.nic_number);
-    if (!member) return res.status(404).json({ error: 'No member matches that membership number and NIC. Please check both and try again.' });
-    res.json(await memberQuote(event, member));
+    const parsed = M.parseMembershipNumber(req.body.membership_number);
+    if (!parsed) return res.status(400).json({ error: NUMBER_FORMAT });
+    const member = await findMember(parsed.number);
+    if (member) return res.json(await memberQuote(event, member));
+    // Not in the register (yet): the prefix gives the category and the fee; SLICNA checks it later.
+    res.json({
+      found: false,
+      eligible: true,
+      membership_number: parsed.number,
+      category: parsed.category,
+      category_label: M.CATEGORIES[parsed.category],
+      fee: E.feeFor(event, parsed.category),
+      message: 'We could not find this number in our online register yet (older records are still being added). You can still register; SLICNA will check your membership.',
+    });
   } catch (err) {
     next(err);
   }
@@ -142,14 +156,20 @@ router.post(
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(values.email)) throw validationError('Please enter a valid email address.');
 
       // Members are checked against the register; their fee follows their category.
+      // A number not in the register is accepted at the fee for its prefix (member_id stays empty, so the admin sees it).
       let feeCategory = 'NM';
       let member = null;
+      let membershipNumber = null;
       if (req.body.registrant_type === 'member') {
-        member = await findMember(req.body.membership_number, values.nic_number);
-        if (!member) throw validationError('No member matches that membership number and NIC. Please check both, or register as a non-member.');
-        const quote = await memberQuote(event, member);
-        if (!quote.eligible) throw validationError(quote.message);
-        feeCategory = member.category;
+        const parsed = M.parseMembershipNumber(req.body.membership_number);
+        if (!parsed) throw validationError(NUMBER_FORMAT);
+        member = await findMember(parsed.number);
+        if (member) {
+          const quote = await memberQuote(event, member);
+          if (!quote.eligible) throw validationError(quote.message);
+        }
+        feeCategory = member ? member.category : parsed.category;
+        membershipNumber = member ? member.membership_number : parsed.number;
       } else if (req.body.registrant_type !== 'non_member') {
         throw validationError('Please choose whether you are registering as a member or a non-member.');
       }
@@ -172,9 +192,9 @@ router.post(
         event_id: event.id,
         event_title: event.title,
         event_date: event.event_date,
-        registrant_type: member ? 'member' : 'non_member',
+        registrant_type: membershipNumber ? 'member' : 'non_member',
         member_id: member ? member.id : null,
-        membership_number: member ? member.membership_number : null,
+        membership_number: membershipNumber,
         fee_category: feeCategory,
         amount_due: amountDue,
         ...values,
@@ -198,6 +218,7 @@ router.post(
       }
 
       sendMailInBackground(emails.registrationReceived(saved));
+      sendMailInBackground(emails.secretaryNewRegistration(saved));
       res.status(201).json({
         reference_number: saved.reference_number,
         amount_due: saved.amount_due,

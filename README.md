@@ -66,7 +66,7 @@ Two kinds of event (`category`): **CPD events** (Workshop, Webinar, Conference, 
 | `POST /api/events/:id/member-check` | Membership number + NIC → the member's category, whether their membership counts (active, renewal due or grace period) and their fee |
 | `POST /api/events/:id/registrations` | Register (multipart). Members are checked against the member register and pay their category's fee. Paid registrations need `pay_by`, `payment_date` and `receipt` (image/PDF). One live registration per NIC per event. Returns a reference like `REG-7KQ2M9XA` |
 
-**Admin endpoints** are under `/api/events/admin/*`: add, edit and delete events (`photo` image and `attachment` PDF; events with registrations can't be deleted), review registrations (confirm, reject with a reason, back to pending, delete, payment slip), counts per status, an Excel file of an event's registrations and an attendance sheet PDF of confirmed registrations. See the header comment in `routes/events-admin.js`.
+**Admin endpoints** are under `/api/events/admin/*`: add, edit and delete events (`photo` image and `attachment` PDF; events with registrations can't be deleted), review registrations (confirm, reject with a reason, back to pending, delete, payment slip), counts per status, an Excel file and a PDF of an event's registrations (same columns and order, filtered by status as in SLNA). See the header comment in `routes/events-admin.js`.
 
 Registration payment slips are private: `private-uploads/events/<event id>/registrations/<reference>/receipt-…`.
 

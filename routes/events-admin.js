@@ -8,8 +8,8 @@
 //   POST   /events                                add (multipart: photo, attachment PDF)
 //   PUT    /events/:id                            edit (remove_image / remove_attachment)
 //   DELETE /events/:id                            delete (only without registrations)
-//   GET    /events/:id/registrations.xlsx         Excel file of all registrations
-//   GET    /events/:id/registrations.pdf          attendance sheet (confirmed only)
+//   GET    /events/:id/registrations.xlsx?status=  Excel download (same rows as the PDF)
+//   GET    /events/:id/registrations.pdf?status=   PDF download (A3 table)
 //   Registrations
 //   GET    /registrations?event_id=&status=&q=
 //   GET    /registrations/counts?event_id=&q=     counts per status tab
@@ -33,7 +33,7 @@ const { deleteUpload } = require('../lib/files');
 const { parseFields, parseId, validationError } = require('../lib/crud');
 const { deletePrivateFile, sendPrivateFile, PRIVATE_ROOT } = require('../lib/private-files');
 const { sendMailInBackground } = require('../lib/mail');
-const { writeRegistrationsPdf } = require('../lib/registrations-pdf');
+const { COLUMNS: EXPORT_COLUMNS, STATUS_LABELS, sortForExport, writeRegistrationsPdf } = require('../lib/registrations-pdf');
 const emails = require('../lib/event-emails');
 
 const router = express.Router();
@@ -241,7 +241,6 @@ router.delete('/events/:id', async (req, res, next) => {
 // ---------- Registrations ----------
 
 const REG_STATUSES = ['pending', 'confirmed', 'rejected'];
-const REG_STATUS_LABELS = { pending: 'Pending', confirmed: 'Confirmed', rejected: 'Rejected' };
 
 function registrationFilters(query, where = [], params = []) {
   const eventId = parseId(query.event_id);
@@ -275,8 +274,9 @@ router.get('/registrations', async (req, res, next) => {
     const { where, params } = registrationFilters(req.query);
     if (REG_STATUSES.includes(req.query.status)) where.push(`r.status = $${params.push(req.query.status)}`);
     res.json((await pool.query(
-      `SELECT r.id, r.reference_number, r.event_id, r.event_title, r.event_date, r.registrant_type, r.membership_number,
-              r.fee_category, r.amount_due, r.full_name, r.nic_number, r.workplace, r.status, r.created_at
+      `SELECT r.id, r.reference_number, r.event_id, r.event_title, r.event_date, r.registrant_type, r.membership_number, r.member_id,
+              r.fee_category, r.amount_due, r.full_name, r.nic_number, r.email, r.workplace, r.pay_by, r.receipt_key IS NOT NULL AS has_receipt,
+              r.status, r.created_at
        FROM event_registrations r ${whereSql(where)}
        ORDER BY CASE r.status WHEN 'pending' THEN 1 ELSE 2 END, r.created_at DESC`,
       params
@@ -354,64 +354,38 @@ router.get('/registrations/:id/receipt', async (req, res, next) => {
 
 // ---------- Exports ----------
 
-const FEE_LABELS = { LT: 'Lifetime member', GM: 'General member', OM: 'Ordinary member', PM: 'Partial member', NM: 'Non-member' };
-const fileSlug = (s) => String(s).replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
+const fileSlug = (s) => String(s).replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 90);
 
-async function eventWithRegistrations(id, statuses) {
-  const event = (await pool.query('SELECT * FROM events WHERE id = $1', [id])).rows[0];
+// The rows for both downloads: ?status=pending|confirmed|rejected (default all),
+// confirmed first, then pending, then rejected, each oldest first (as in SLNA).
+async function exportRows(req) {
+  const event = (await pool.query('SELECT * FROM events WHERE id = $1', [parseId(req.params.id)])).rows[0];
   if (!event) return null;
+  const status = REG_STATUSES.includes(req.query.status) ? req.query.status : null;
   const regs = (await pool.query(
-    'SELECT * FROM event_registrations WHERE event_id = $1 AND status = ANY($2) ORDER BY upper(certificate_name)',
-    [id, statuses]
+    `SELECT * FROM event_registrations WHERE event_id = $1 ${status ? 'AND status = $2' : ''}`,
+    status ? [event.id, status] : [event.id]
   )).rows;
-  return { event, regs };
+  const label = status ? STATUS_LABELS[status] : 'All';
+  return { event, regs: sortForExport(regs), label, filename: `registrations-${fileSlug(event.title).toLowerCase()}-${label.toLowerCase()}` };
 }
 
-// Every registration for the event (all statuses) as an Excel workbook.
 router.get('/events/:id/registrations.xlsx', async (req, res, next) => {
   try {
-    const found = await eventWithRegistrations(parseId(req.params.id), REG_STATUSES);
+    const found = await exportRows(req);
     if (!found) return notFound(res, 'Event not found.');
-    const date = (v) => (v ? new Date(String(v instanceof Date ? v.toISOString() : v).slice(0, 10) + 'T00:00:00Z') : null);
     const book = new ExcelJS.Workbook();
     book.creator = 'SLICNA admin';
     const sheet = book.addWorksheet('Registrations', { views: [{ state: 'frozen', ySplit: 1 }] });
-    sheet.columns = [
-      { header: 'Reference', key: 'reference_number', width: 16 },
-      { header: 'Status', key: 'status', width: 12 },
-      { header: 'Registered on', key: 'created_at', width: 14, style: { numFmt: 'dd mmm yyyy' } },
-      { header: 'Full name', key: 'full_name', width: 30 },
-      { header: 'Name on certificate', key: 'certificate_name', width: 30 },
-      { header: 'NIC', key: 'nic_number', width: 15 },
-      { header: 'Registered as', key: 'registered_as', width: 18 },
-      { header: 'Membership number', key: 'membership_number', width: 18 },
-      { header: 'SLNC number', key: 'slnc_number', width: 14 },
-      { header: 'Email', key: 'email', width: 30 },
-      { header: 'Mobile', key: 'mobile', width: 14 },
-      { header: 'Workplace', key: 'workplace', width: 28 },
-      { header: 'Workplace address', key: 'workplace_address', width: 32 },
-      { header: 'Postal address', key: 'postal_address', width: 32 },
-      { header: 'Fee (LKR)', key: 'amount_due', width: 12, style: { numFmt: '#,##0.00' } },
-      { header: 'Paid by', key: 'pay_by', width: 14 },
-      { header: 'Payment date', key: 'payment_date', width: 14, style: { numFmt: 'dd mmm yyyy' } },
-      { header: 'Note', key: 'status_note', width: 36 },
-    ];
-    found.regs.forEach((r) => sheet.addRow({
-      ...r,
-      status: REG_STATUS_LABELS[r.status],
-      created_at: date(r.created_at),
-      registered_as: FEE_LABELS[r.fee_category],
-      amount_due: Number(r.amount_due),
-      pay_by: r.pay_by ? (r.pay_by === 'organisation' ? 'Organisation' : 'Individual') : '',
-      payment_date: date(r.payment_date),
-    }));
+    sheet.columns = EXPORT_COLUMNS.map((c, i) => ({ header: c.label, key: String(i), width: c.excel, ...(c.money ? { style: { numFmt: '#,##0.00' } } : {}) }));
+    found.regs.forEach((r, n) => sheet.addRow(Object.fromEntries(EXPORT_COLUMNS.map((c, i) => [String(i), c.value(r, n)]))));
     const header = sheet.getRow(1);
     header.font = { bold: true, color: { argb: 'FFFFFFFF' } };
-    header.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0D6B67' } };
-    sheet.autoFilter = { from: 'A1', to: { row: 1, column: sheet.columns.length } };
+    header.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF083F3D' } };
+    sheet.autoFilter = { from: 'A1', to: { row: 1, column: EXPORT_COLUMNS.length } };
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Cache-Control', 'private, no-store');
-    res.setHeader('Content-Disposition', `attachment; filename="${fileSlug(found.event.title)}-registrations.xlsx"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${found.filename}.xlsx"`);
     await book.xlsx.write(res);
     res.end();
   } catch (err) {
@@ -421,12 +395,12 @@ router.get('/events/:id/registrations.xlsx', async (req, res, next) => {
 
 router.get('/events/:id/registrations.pdf', async (req, res, next) => {
   try {
-    const found = await eventWithRegistrations(parseId(req.params.id), ['confirmed']);
+    const found = await exportRows(req);
     if (!found) return notFound(res, 'Event not found.');
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Cache-Control', 'private, no-store');
-    res.setHeader('Content-Disposition', `attachment; filename="${fileSlug(found.event.title)}-attendance.pdf"`);
-    writeRegistrationsPdf(res, found.event, found.regs, FEE_LABELS);
+    res.setHeader('Content-Disposition', `attachment; filename="${found.filename}.pdf"`);
+    writeRegistrationsPdf(res, found.event, found.regs, found.label);
   } catch (err) {
     next(err);
   }
