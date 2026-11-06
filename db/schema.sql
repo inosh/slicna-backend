@@ -80,15 +80,26 @@ CREATE TABLE IF NOT EXISTS public.committee_members
 );
 
 -- Table: public.events
--- All events: accredited CPD programmes, international workshops and
--- community events. The CPD page lists events that have cpd_points and
--- totals them; the Events page lists everything.
+-- Two kinds of event (category):
+--   cpd    CPD events (workshops, webinars, conferences, ...). They carry
+--          CPD points, an audience, fees and online registration.
+--   other  Other events (AGMs, community events, ...): information only.
+-- event_type is the finer type within the kind (see lib/events.js).
+-- status: cpd       coming_soon | opening_soon | open | closed
+--         other     coming_soon | upcoming
+-- Past events show as completed whatever the status.
+-- Fees (cpd only): fee_type free | paid. When paid, members pay member_fee
+-- (member_pricing = same) or the fee for their category, fee_lt / fee_gm /
+-- fee_om / fee_pm (member_pricing = by_category); non-members pay
+-- non_member_fee (not used when audience = members). A fee of 0 is free.
 
 CREATE TABLE IF NOT EXISTS public.events
 (
     id serial NOT NULL,
     title character varying(300) NOT NULL,
     category character varying(20) NOT NULL DEFAULT 'cpd',
+    event_type character varying(60) NOT NULL DEFAULT 'Workshop',
+    status character varying(20) NOT NULL DEFAULT 'coming_soon',
     event_date date NOT NULL,
     end_date date,
     time_text character varying(100),
@@ -96,16 +107,68 @@ CREATE TABLE IF NOT EXISTS public.events
     summary text,
     body text,
     cpd_points numeric(5,2),
+    audience character varying(20) NOT NULL DEFAULT 'public',
+    fee_type character varying(10) NOT NULL DEFAULT 'free',
+    member_pricing character varying(20) NOT NULL DEFAULT 'same',
+    member_fee numeric(10,2),
+    fee_lt numeric(10,2),
+    fee_gm numeric(10,2),
+    fee_om numeric(10,2),
+    fee_pm numeric(10,2),
+    non_member_fee numeric(10,2),
     photo_url character varying(500),
+    attachment_url character varying(500),
+    attachment_name character varying(255),
     created_at timestamp with time zone NOT NULL DEFAULT now(),
     updated_at timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT events_pkey PRIMARY KEY (id),
-    CONSTRAINT events_category_check CHECK (category IN ('cpd', 'international', 'community')),
     CONSTRAINT events_end_date_check CHECK (end_date IS NULL OR end_date >= event_date),
     CONSTRAINT events_cpd_points_check CHECK (cpd_points IS NULL OR cpd_points >= 0)
 );
 
 CREATE INDEX IF NOT EXISTS events_event_date_idx ON public.events (event_date);
+
+-- Nov 2026: CPD events vs other events, with types, statuses, audience and
+-- fees. Moves the old categories (cpd / international / community) across.
+-- Safe to re-run.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'events' AND column_name = 'status') THEN
+        ALTER TABLE public.events ADD COLUMN status character varying(20) NOT NULL DEFAULT 'coming_soon';
+        -- Past events: registration closed. Upcoming ones wait for the admin to open registration.
+        UPDATE public.events SET status = CASE WHEN COALESCE(end_date, event_date) < CURRENT_DATE THEN 'closed' ELSE 'opening_soon' END;
+    END IF;
+END $$;
+
+ALTER TABLE public.events
+    ADD COLUMN IF NOT EXISTS event_type character varying(60) NOT NULL DEFAULT 'Workshop',
+    ADD COLUMN IF NOT EXISTS audience character varying(20) NOT NULL DEFAULT 'public',
+    ADD COLUMN IF NOT EXISTS fee_type character varying(10) NOT NULL DEFAULT 'free',
+    ADD COLUMN IF NOT EXISTS member_pricing character varying(20) NOT NULL DEFAULT 'same',
+    ADD COLUMN IF NOT EXISTS member_fee numeric(10,2),
+    ADD COLUMN IF NOT EXISTS fee_lt numeric(10,2),
+    ADD COLUMN IF NOT EXISTS fee_gm numeric(10,2),
+    ADD COLUMN IF NOT EXISTS fee_om numeric(10,2),
+    ADD COLUMN IF NOT EXISTS fee_pm numeric(10,2),
+    ADD COLUMN IF NOT EXISTS non_member_fee numeric(10,2),
+    ADD COLUMN IF NOT EXISTS attachment_url character varying(500),
+    ADD COLUMN IF NOT EXISTS attachment_name character varying(255);
+
+ALTER TABLE public.events DROP CONSTRAINT IF EXISTS events_category_check;
+UPDATE public.events SET category = 'cpd', event_type = 'International Workshop' WHERE category = 'international';
+UPDATE public.events SET category = 'other', event_type = 'Community Event', status = 'upcoming' WHERE category = 'community';
+ALTER TABLE public.events ADD CONSTRAINT events_category_check CHECK (category IN ('cpd', 'other'));
+
+ALTER TABLE public.events DROP CONSTRAINT IF EXISTS events_status_check;
+ALTER TABLE public.events ADD CONSTRAINT events_status_check
+    CHECK (status IN ('coming_soon', 'opening_soon', 'open', 'closed', 'upcoming'));
+ALTER TABLE public.events DROP CONSTRAINT IF EXISTS events_audience_check;
+ALTER TABLE public.events ADD CONSTRAINT events_audience_check CHECK (audience IN ('public', 'members'));
+ALTER TABLE public.events DROP CONSTRAINT IF EXISTS events_fee_check;
+ALTER TABLE public.events ADD CONSTRAINT events_fee_check CHECK (
+    fee_type IN ('free', 'paid') AND member_pricing IN ('same', 'by_category')
+    AND COALESCE(member_fee, 0) >= 0 AND COALESCE(fee_lt, 0) >= 0 AND COALESCE(fee_gm, 0) >= 0
+    AND COALESCE(fee_om, 0) >= 0 AND COALESCE(fee_pm, 0) >= 0 AND COALESCE(non_member_fee, 0) >= 0);
 
 -- Table: public.news
 -- News articles. body is plain text; blank lines separate paragraphs.
@@ -198,7 +261,8 @@ CREATE TABLE IF NOT EXISTS public.community_items
 -- Membership
 -- Categories: LT (Lifetime), GM (General), OM (Ordinary), PM (Partial).
 -- LT never expires; the others are valid for 12 months at a time.
--- Uploaded documents (photo, payment slip, signed recommendation page) are
+-- No recommendation or institution certification is needed for any category.
+-- Uploaded documents (photo, payment slip) are
 -- PRIVATE: they live in private-uploads/ (later an R2 private bucket) under
 -- keys like "membership/applications/<ref>/photo-....jpg", are never served
 -- statically, and are only streamed to logged-in admins.
@@ -239,7 +303,7 @@ ON CONFLICT (key) DO NOTHING;
 
 -- Table: public.membership_applications
 -- Online applications. status flow:
---   pending -> under_review -> (more_info_required <-> under_review) -> approved | rejected
+--   pending -> approved | rejected, with more_info_required (and back to pending) while waiting on the applicant.
 -- status_note is shown to the applicant on the status page; admin_notes is internal.
 
 CREATE TABLE IF NOT EXISTS public.membership_applications
@@ -285,17 +349,8 @@ CREATE TABLE IF NOT EXISTS public.membership_applications
     slnc_not_registered boolean NOT NULL DEFAULT false,
     slna_not_member boolean NOT NULL DEFAULT false,
 
-    -- GM/OM: the recommending Lifetime member. PM: the certifying institution
-    -- officer (endorser_workplace = institution, endorser_designation = title).
-    endorser_name character varying(255),
-    endorser_membership_number character varying(30),
-    endorser_contact character varying(30),
-    endorser_workplace character varying(255),
-    endorser_designation character varying(100),
-
     photo_key character varying(500),
     receipt_key character varying(500),
-    endorsement_key character varying(500),
     payment_amount numeric(10,2),
     payment_date date,
     declaration_confirmed boolean NOT NULL DEFAULT false,
@@ -308,10 +363,29 @@ CREATE TABLE IF NOT EXISTS public.membership_applications
     CONSTRAINT membership_applications_pkey PRIMARY KEY (id),
     CONSTRAINT membership_applications_reference_key UNIQUE (reference_number),
     CONSTRAINT membership_applications_category_check CHECK (category IN ('LT', 'GM', 'OM', 'PM')),
-    CONSTRAINT membership_applications_status_check CHECK (status IN ('pending', 'under_review', 'more_info_required', 'approved', 'rejected'))
+    CONSTRAINT membership_applications_status_check CHECK (status IN ('pending', 'more_info_required', 'approved', 'rejected'))
 );
 
 CREATE INDEX IF NOT EXISTS membership_applications_status_idx ON public.membership_applications (status, created_at DESC);
+
+-- Recommendations (GM/OM) and institution certification (PM) were dropped in
+-- Nov 2026; this removes their columns from databases created before that.
+ALTER TABLE public.membership_applications
+    DROP COLUMN IF EXISTS endorser_name,
+    DROP COLUMN IF EXISTS endorser_membership_number,
+    DROP COLUMN IF EXISTS endorser_contact,
+    DROP COLUMN IF EXISTS endorser_workplace,
+    DROP COLUMN IF EXISTS endorser_designation,
+    DROP COLUMN IF EXISTS endorsement_key,
+    DROP COLUMN IF EXISTS eligibility_basis;
+
+-- The "under review" status was dropped in Nov 2026 (nothing left to review
+-- once recommendations went): move such applications back to pending and
+-- replace the status check. Safe to re-run.
+UPDATE public.membership_applications SET status = 'pending' WHERE status = 'under_review';
+ALTER TABLE public.membership_applications DROP CONSTRAINT IF EXISTS membership_applications_status_check;
+ALTER TABLE public.membership_applications ADD CONSTRAINT membership_applications_status_check
+    CHECK (status IN ('pending', 'more_info_required', 'approved', 'rejected'));
 
 -- Table: public.members
 -- Approved members (from an application) and members added by an admin.
@@ -345,6 +419,7 @@ CREATE TABLE IF NOT EXISTS public.members
     source character varying(20) NOT NULL DEFAULT 'application',
     admin_notes text,
     id_application_created_at timestamp with time zone,
+    id_application_created_by integer,
     created_at timestamp with time zone NOT NULL DEFAULT now(),
     updated_at timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT members_pkey PRIMARY KEY (id),
@@ -358,6 +433,9 @@ CREATE TABLE IF NOT EXISTS public.members
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS members_nic_key ON public.members (upper(nic_number));
+
+-- Who confirmed the ID card application (added Nov 2026).
+ALTER TABLE public.members ADD COLUMN IF NOT EXISTS id_application_created_by integer;
 
 -- Table: public.renewal_requests
 -- Renewals and upgrades (e.g. GM -> LT) submitted by members through their
@@ -395,6 +473,13 @@ CREATE TABLE IF NOT EXISTS public.renewal_requests
 
 CREATE INDEX IF NOT EXISTS renewal_requests_status_idx ON public.renewal_requests (status, created_at DESC);
 
+-- Nov 2026: an upgrade to Lifetime asks for the same PBCN ICU training details
+-- as a Lifetime application.
+ALTER TABLE public.renewal_requests
+    ADD COLUMN IF NOT EXISTS icu_training_batch character varying(50),
+    ADD COLUMN IF NOT EXISTS icu_training_type character varying(20),
+    ADD COLUMN IF NOT EXISTS icu_training_year integer;
+
 -- Table: public.renewal_tokens
 -- Personal renewal links. Only a SHA-256 hash of the token is stored.
 
@@ -431,3 +516,96 @@ CREATE TABLE IF NOT EXISTS public.reminder_log
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS reminder_log_sent_once ON public.reminder_log (member_id, kind, period_key) WHERE status = 'sent';
+
+-- Table: public.event_registrations
+-- Online registrations for CPD events. Members are verified against the
+-- members table (membership number + NIC) and pay the fee for their
+-- category; fee_category is LT / GM / OM / PM or NM (non-member) and
+-- amount_due is the fee at the time of registering. event_title and
+-- event_date are kept so the record still reads well if the event is
+-- edited. Receipts are private files (private-uploads/events/...).
+-- status: pending -> confirmed | rejected (status_note = reason).
+
+CREATE TABLE IF NOT EXISTS public.event_registrations
+(
+    id serial NOT NULL,
+    reference_number character varying(20) NOT NULL,
+    event_id integer NOT NULL,
+    event_title character varying(300) NOT NULL,
+    event_date date NOT NULL,
+    registrant_type character varying(20) NOT NULL,
+    member_id integer,
+    membership_number character varying(30),
+    fee_category character varying(2) NOT NULL,
+    amount_due numeric(10,2) NOT NULL DEFAULT 0,
+    full_name character varying(255) NOT NULL,
+    certificate_name character varying(255) NOT NULL,
+    nic_number character varying(20) NOT NULL,
+    slnc_number character varying(50),
+    email character varying(255) NOT NULL,
+    mobile character varying(30) NOT NULL,
+    postal_address text NOT NULL,
+    workplace character varying(255) NOT NULL,
+    workplace_address text NOT NULL,
+    pay_by character varying(20),
+    payment_date date,
+    receipt_key character varying(500),
+    status character varying(20) NOT NULL DEFAULT 'pending',
+    status_note text,
+    admin_notes text,
+    reviewed_by integer,
+    reviewed_at timestamp with time zone,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT event_registrations_pkey PRIMARY KEY (id),
+    CONSTRAINT event_registrations_reference_key UNIQUE (reference_number),
+    CONSTRAINT event_registrations_event_fkey FOREIGN KEY (event_id)
+        REFERENCES public.events (id) ON DELETE RESTRICT,
+    CONSTRAINT event_registrations_member_fkey FOREIGN KEY (member_id)
+        REFERENCES public.members (id) ON DELETE SET NULL,
+    CONSTRAINT event_registrations_type_check CHECK (registrant_type IN ('member', 'non_member')),
+    CONSTRAINT event_registrations_fee_category_check CHECK (fee_category IN ('LT', 'GM', 'OM', 'PM', 'NM')),
+    CONSTRAINT event_registrations_pay_by_check CHECK (pay_by IS NULL OR pay_by IN ('individual', 'organisation')),
+    CONSTRAINT event_registrations_status_check CHECK (status IN ('pending', 'confirmed', 'rejected'))
+);
+
+CREATE INDEX IF NOT EXISTS event_registrations_event_idx ON public.event_registrations (event_id, status);
+-- One live registration per person per event (a rejected one can be redone).
+CREATE UNIQUE INDEX IF NOT EXISTS event_registrations_once ON public.event_registrations (event_id, upper(nic_number)) WHERE status <> 'rejected';
+
+-- Table: public.retired_membership_numbers
+-- Numbers a member gave up (e.g. their GM number when upgrading to Lifetime).
+-- They are never suggested or assigned again, so old ID cards, letters and
+-- records stay unambiguous. The upgrade request also keeps the number in
+-- renewal_requests.previous_membership_number.
+
+CREATE TABLE IF NOT EXISTS public.retired_membership_numbers
+(
+    id serial NOT NULL,
+    membership_number character varying(30) NOT NULL,
+    member_id integer,
+    reason character varying(30) NOT NULL DEFAULT 'upgrade',
+    retired_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT retired_membership_numbers_pkey PRIMARY KEY (id),
+    CONSTRAINT retired_membership_numbers_member_fkey FOREIGN KEY (member_id)
+        REFERENCES public.members (id) ON DELETE SET NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS retired_membership_numbers_key
+    ON public.retired_membership_numbers (regexp_replace(upper(membership_number), '[^A-Z0-9]', '', 'g'));
+
+ALTER TABLE public.renewal_requests ADD COLUMN IF NOT EXISTS previous_membership_number character varying(30);
+
+-- Upgrades verified before this table existed: the old number is recovered
+-- from the payment reference of online renewals ("GM000226-2611" -> "GM 0002/26").
+INSERT INTO public.retired_membership_numbers (membership_number, member_id, reason, retired_at)
+SELECT regexp_replace(r.payment_reference, '^([A-Z]{2})(\d{4})(\d{2})-\d{4}$', '\1 \2/\3'), r.member_id, 'upgrade', COALESCE(r.reviewed_at, r.created_at)
+FROM public.renewal_requests r
+WHERE r.kind = 'upgrade' AND r.status = 'verified' AND NOT r.recorded_by_admin
+  AND r.payment_reference ~ '^[A-Z]{2}\d{6}-\d{4}$'
+ON CONFLICT DO NOTHING;
+
+UPDATE public.renewal_requests r
+SET previous_membership_number = regexp_replace(r.payment_reference, '^([A-Z]{2})(\d{4})(\d{2})-\d{4}$', '\1 \2/\3')
+WHERE r.kind = 'upgrade' AND r.status = 'verified' AND NOT r.recorded_by_admin
+  AND r.previous_membership_number IS NULL AND r.payment_reference ~ '^[A-Z]{2}\d{6}-\d{4}$';

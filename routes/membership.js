@@ -7,13 +7,15 @@
 //   GET  /api/membership/renew/:token      what the renewal page shows
 //   POST /api/membership/renew/:token      submit a renewal or upgrade (multipart)
 
+const fs = require('fs');
+const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const pool = require('../db/pool');
 const M = require('../lib/membership');
 const { parseFields, validationError } = require('../lib/crud');
-const { privateUpload, uploadedKey, discardUploads } = require('../lib/private-files');
+const { privateUpload, uploadedKey, discardUploads, PRIVATE_ROOT } = require('../lib/private-files');
 const { sendMailInBackground } = require('../lib/mail');
 const emails = require('../lib/membership-emails');
 
@@ -39,11 +41,11 @@ router.get('/info', async (req, res, next) => {
 
 // ---------- Applications ----------
 
+// Reference numbers: <category>-<date applied, YYYYMMDD>-<6-character code>, e.g.
+// LT-20261106-7KQ2M9. The code avoids look-alike characters (0/O, 1/I).
 const REF_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-function newReference() {
-  const bytes = crypto.randomBytes(8);
-  return 'APP-' + [...bytes].map((b) => REF_CHARS[b % REF_CHARS.length]).join('');
-}
+const newCode = () => [...crypto.randomBytes(6)].map((b) => REF_CHARS[b % REF_CHARS.length]).join('');
+const referenceFor = (category, code) => `${category}-${M.today().replace(/-/g, '')}-${code}`;
 
 // Every field on the paper forms is required, except the ones SLNA's online
 // join form also leaves optional: WhatsApp, residential and office phones and
@@ -94,39 +96,39 @@ const CATEGORY_FIELDS = {
     icu_training_type: { type: 'enum', label: 'ICU training (diploma or certificate)', required: true, values: ['diploma', 'certificate'] },
     icu_training_year: { type: 'int', label: 'ICU training year', required: true, min: 1950, max: 2100 },
   },
-  GM: {
-    ...NURSE_FIELDS,
-    endorser_name: { type: 'text', label: "Recommending member's name", required: true, max: 255 },
-    endorser_membership_number: { type: 'text', label: "Recommending member's LT number", required: true, max: 30 },
-    endorser_contact: { type: 'text', label: "Recommending member's contact number", required: true, max: 30 },
-    endorser_workplace: { type: 'text', label: "Recommending member's working place and hospital", required: true, max: 255 },
-  },
+  GM: { ...NURSE_FIELDS },
+  OM: { ...NURSE_FIELDS },
   PM: {
     student_number: { type: 'text', label: 'Student number', required: true, max: 50 },
     institute_registration_date: { type: 'date', label: 'Date of registration at the institute', required: true },
-    endorser_workplace: { type: 'text', label: 'Certifying institution', required: true, max: 255 },
-    endorser_name: { type: 'text', label: 'Certifying officer name', required: true, max: 255 },
-    endorser_designation: { type: 'text', label: 'Certifying officer title', required: true, max: 100 },
-    endorser_contact: { type: 'text', label: 'Institution contact number', max: 30 },
   },
 };
-CATEGORY_FIELDS.OM = CATEGORY_FIELDS.GM;
 
-const NEEDS_ENDORSEMENT = new Set(['GM', 'OM', 'PM']);
-
-// The reference number is decided before the files are saved, so they go
-// into membership/applications/<reference>/.
+// Files are saved before the form fields are read, so the category (the
+// start of the reference) isn't known yet: they go into an upload-<code>
+// folder that is renamed to membership/applications/<reference>/ once the
+// application is accepted.
 function assignReference(req, res, next) {
-  req.applicationReference = newReference();
+  req.referenceCode = newCode();
   next();
+}
+
+const APPLICATIONS_DIR = path.join(PRIVATE_ROOT, 'membership', 'applications');
+
+// Moves the uploads to the reference's folder; returns the new file keys.
+function moveUploadsTo(req, reference) {
+  fs.renameSync(path.join(APPLICATIONS_DIR, `upload-${req.referenceCode}`), path.join(APPLICATIONS_DIR, reference));
+  const rekey = (key) => key.replace(`membership/applications/upload-${req.referenceCode}/`, `membership/applications/${reference}/`);
+  return { photo_key: rekey(uploadedKey(req, 'photo')), receipt_key: rekey(uploadedKey(req, 'receipt')) };
 }
 
 router.post(
   '/applications',
   applyLimiter,
   assignReference,
-  privateUpload((req) => `membership/applications/${req.applicationReference}`, { photo: 'image', receipt: 'document', endorsement: 'document' }),
+  privateUpload((req) => `membership/applications/upload-${req.referenceCode}`, { photo: 'image', receipt: 'document' }),
   async (req, res, next) => {
+    let reference = null;
     try {
       const category = String(req.body.category || '').toUpperCase();
       if (!M.CATEGORIES[category]) throw validationError('Please choose a membership category.');
@@ -150,31 +152,27 @@ router.post(
       values.whatsapp = M.checkPhone(values.whatsapp, 'phone', 'WhatsApp number');
       values.residential_phone = M.checkPhone(values.residential_phone, 'phone', 'Residential phone');
       values.office_phone = M.checkPhone(values.office_phone, 'phone', 'Office phone');
-      if (values.endorser_contact) values.endorser_contact = M.checkPhone(values.endorser_contact, 'phone', category === 'PM' ? 'Institution contact number' : "Recommending member's contact number");
       if (req.body.declaration !== 'true') throw validationError('Please confirm that the details you entered are true.');
 
       if (!uploadedKey(req, 'photo')) throw validationError('Please upload a passport-size photo.');
       if (!uploadedKey(req, 'receipt')) throw validationError('Please upload your payment slip or receipt.');
-      if (NEEDS_ENDORSEMENT.has(category) && !uploadedKey(req, 'endorsement')) {
-        throw validationError(category === 'PM' ? 'Please upload the page certified by your nursing school or university.' : 'Please upload the recommendation page signed by a Lifetime member.');
-      }
 
       const member = (await pool.query('SELECT 1 FROM members WHERE upper(nic_number) = $1', [values.nic_number])).rows[0];
       if (member) throw validationError('A member with this NIC number already exists. To renew or upgrade, use "Renew membership".');
       const open = (await pool.query(
-        "SELECT reference_number FROM membership_applications WHERE upper(nic_number) = $1 AND status IN ('pending', 'under_review', 'more_info_required')",
+        "SELECT reference_number FROM membership_applications WHERE upper(nic_number) = $1 AND status IN ('pending', 'more_info_required')",
         [values.nic_number]
       )).rows[0];
       if (open) throw validationError(`You already have an application in progress (${open.reference_number}). You can check it on the "Check application status" page.`);
 
       const fees = await M.loadFees();
+      reference = referenceFor(category, req.referenceCode);
+      const files = moveUploadsTo(req, reference);
       const row = {
         ...values,
-        reference_number: req.applicationReference,
+        reference_number: reference,
         category,
-        photo_key: uploadedKey(req, 'photo'),
-        receipt_key: uploadedKey(req, 'receipt'),
-        endorsement_key: uploadedKey(req, 'endorsement'),
+        ...files,
         payment_amount: fees[category].amount,
         declaration_confirmed: true,
       };
@@ -185,9 +183,12 @@ router.post(
       )).rows[0];
 
       sendMailInBackground(emails.applicationReceived(app));
+      sendMailInBackground(emails.secretaryNewApplication(app));
       res.status(201).json({ reference_number: app.reference_number, category: app.category, status: app.status });
     } catch (err) {
       discardUploads(req);
+      fs.rm(path.join(APPLICATIONS_DIR, `upload-${req.referenceCode}`), { recursive: true, force: true }, () => {});
+      if (reference) fs.rm(path.join(APPLICATIONS_DIR, reference), { recursive: true, force: true }, () => {});
       next(err);
     }
   }
@@ -195,7 +196,6 @@ router.post(
 
 const STATUS_MESSAGES = {
   pending: 'Your application has been received and is waiting for review.',
-  under_review: 'Your application is being reviewed.',
   more_info_required: 'We need more information to continue with your application.',
   approved: 'Your application has been approved. Welcome to SLICNA!',
   rejected: 'Your application could not be approved.',
@@ -226,6 +226,7 @@ router.post('/status', lookupLimiter, async (req, res, next) => {
       status: app.status,
       status_message: STATUS_MESSAGES[app.status],
       status_note: app.status_note,
+      follow_up: emails.applicantFollowUp(app),
       membership_number: member ? member.membership_number : null,
       valid_until: member ? member.valid_until : null,
     });
@@ -240,10 +241,11 @@ router.post('/renew/lookup', lookupLimiter, async (req, res, next) => {
   try {
     const number = M.compactNumber(req.body.membership_number);
     const nic = M.normaliseNic(req.body.nic_number);
+    // Either NIC format matches (old 9 digits + V/X, or new 12 digits).
     const member = number && nic
       ? (await pool.query(
-        "SELECT id FROM members WHERE regexp_replace(upper(membership_number), '[^A-Z0-9]', '', 'g') = $1 AND upper(nic_number) = $2",
-        [number, nic]
+        "SELECT id FROM members WHERE regexp_replace(upper(membership_number), '[^A-Z0-9]', '', 'g') = $1 AND upper(nic_number) = ANY($2)",
+        [number, M.nicVariants(nic)]
       )).rows[0]
       : null;
     if (!member) return res.status(404).json({ error: 'No member matches that membership number and NIC. Please check both and try again.' });
@@ -297,11 +299,19 @@ router.get('/renew/:token', lookupLimiter, async (req, res, next) => {
 
 const RENEWAL_FIELDS = {
   kind: { type: 'enum', label: 'Renewal type', required: true, values: ['renewal', 'upgrade'] },
-  nic_last4: { type: 'text', label: 'Last 4 digits of your NIC', required: true, max: 4 },
+  nic_number: { type: 'text', label: 'NIC number', required: true, max: 20 },
   email: { type: 'text', label: 'Email', max: 255 },
   mobile: { type: 'text', label: 'Mobile number', max: 30 },
   current_working_place: { type: 'text', label: 'Current working place', max: 255 },
   payment_date: { type: 'date', label: 'Payment date', required: true },
+};
+
+// Upgrading to Lifetime needs the Lifetime requirement: PBCN ICU training
+// (same fields and rules as the Lifetime application form).
+const UPGRADE_FIELDS = {
+  icu_training_batch: { type: 'text', label: 'ICU training batch (PBCN)', required: true, max: 50 },
+  icu_training_type: { type: 'enum', label: 'ICU training (diploma or certificate)', required: true, values: ['diploma', 'certificate'] },
+  icu_training_year: { type: 'int', label: 'ICU training year', required: true, min: 1950, max: 2100 },
 };
 
 router.post(
@@ -321,7 +331,10 @@ router.post(
     const member = req.renewalMember;
     try {
       const values = parseFields(req.body, RENEWAL_FIELDS);
-      if (values.nic_last4 !== M.nicLast4(member.nic_number)) throw validationError('The NIC digits do not match our records.');
+      const upgrade = values.kind === 'upgrade'
+        ? parseFields(req.body, UPGRADE_FIELDS)
+        : { icu_training_batch: null, icu_training_type: null, icu_training_year: null };
+      if (!M.nicMatches(member.nic_number, values.nic_number)) throw validationError('This NIC number does not match our records for this membership.');
       if (!uploadedKey(req, 'receipt')) throw validationError('Please upload your payment slip or receipt.');
       values.mobile = M.checkPhone(values.mobile, 'mobile', 'Mobile number');
       if (values.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(values.email)) throw validationError('Please enter a valid email address.');
@@ -334,16 +347,19 @@ router.post(
 
       const request = (await pool.query(
         `INSERT INTO renewal_requests (member_id, kind, from_category, to_category, amount, payment_reference, payment_date,
-           receipt_key, email, mobile, current_working_place, previous_valid_until)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+           receipt_key, email, mobile, current_working_place, previous_valid_until,
+           icu_training_batch, icu_training_type, icu_training_year)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING *`,
         [
           member.id, values.kind, member.category, values.kind === 'upgrade' ? 'LT' : member.category,
           values.kind === 'upgrade' ? view.upgrade.amount : view.renewal.amount, view.payment_reference, values.payment_date,
           uploadedKey(req, 'receipt'), values.email, values.mobile, values.current_working_place, member.valid_until,
+          upgrade.icu_training_batch, upgrade.icu_training_type, upgrade.icu_training_year,
         ]
       )).rows[0];
 
       sendMailInBackground(emails.renewalSubmitted(member, request));
+      sendMailInBackground(emails.secretaryRenewalSubmitted(member, request));
       res.status(201).json({ payment_reference: request.payment_reference, status: request.status });
     } catch (err) {
       discardUploads(req);

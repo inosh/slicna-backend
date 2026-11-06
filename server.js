@@ -12,6 +12,7 @@ require('dotenv').config();
 const authRoutes = require('./routes/auth');
 const newsRoutes = require('./routes/news');
 const eventsRoutes = require('./routes/events');
+const eventsAdminRoutes = require('./routes/events-admin');
 const milestonesRoutes = require('./routes/milestones');
 const committeeRoutes = require('./routes/committee');
 const settingsRoutes = require('./routes/settings');
@@ -43,6 +44,8 @@ app.use(cors({
     }
     return callback(new Error('Not allowed by CORS'));
   },
+  // Lets the admin panel save private downloads under the server's file name.
+  exposedHeaders: ['Content-Disposition'],
 }));
 
 app.use(express.json());
@@ -54,6 +57,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads'), { maxAge: '7
 // --- Routes ---
 app.use('/api/auth', authRoutes);
 app.use('/api/news', newsRoutes);
+app.use('/api/events/admin', eventsAdminRoutes);
 app.use('/api/events', eventsRoutes);
 app.use('/api/milestones', milestonesRoutes);
 app.use('/api/committee', committeeRoutes);
