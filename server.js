@@ -82,7 +82,7 @@ app.use('/api', (req, res) => {
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
     if (err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ error: 'That file is too large. Photos must be under 15MB, journal PDFs under 30MB, and membership documents under 10MB.' });
+      return res.status(400).json({ error: 'That file is too large. Photos must be under 15MB, videos under 100MB, journal PDFs under 30MB, and membership documents under 10MB.' });
     }
     if (err.code === 'LIMIT_UNEXPECTED_FILE') {
       return res.status(400).json({ error: 'Too many files selected, or an unexpected file field was used.' });

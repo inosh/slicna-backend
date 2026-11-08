@@ -21,12 +21,12 @@
 //   GET    /members/:id                       details, renewal history, reminders
 //   POST   /members                           add a member manually (optional photo)
 //   PUT    /members/:id                       edit details (optional new photo)
-//   POST   /members/:id/deactivate | /reactivate
+//   POST   /members/:id/deactivate | /reactivate   (reactivate can renew or upgrade at the same time)
 //   GET    /members/:id/photo | /id-photo     inline | download for the ID card
 //   GET    /members/:id/id-application.pdf    ID card application form
 //   POST   /members/:id/id-application        confirm the ID application was created
 //   POST   /members/:id/renewal-link          new renewal link (optionally emailed)
-//   POST   /members/:id/payments              record a payment (cash / bank) directly
+//   POST   /members/:id/payments              renew / upgrade with a payment taken offline
 //   Renewals
 //   GET    /renewals?status=
 //   GET    /renewals/counts                   counts per status tab
@@ -621,19 +621,6 @@ router.post('/members/:id/deactivate', form, async (req, res, next) => {
   }
 });
 
-router.post('/members/:id/reactivate', async (req, res, next) => {
-  try {
-    const row = (await pool.query(
-      'UPDATE members SET is_active = true, deactivated_reason = NULL, deactivated_at = NULL, updated_at = now() WHERE id = $1 RETURNING id',
-      [parseId(req.params.id)]
-    )).rows[0];
-    if (!row) return notFound(res, 'Member not found.');
-    res.json({ success: true });
-  } catch (err) {
-    next(err);
-  }
-});
-
 router.get('/members/:id/photo', async (req, res, next) => {
   try {
     const member = await getMember(parseId(req.params.id));
@@ -701,16 +688,21 @@ router.post('/members/:id/renewal-link', form, async (req, res, next) => {
 // ---------- Renewals ----------
 
 // Applies a verified renewal or upgrade to the member.
-// Returns the updated member. On an upgrade the old number is retired
-// (reserved for good) and returned as updated.previous_membership_number.
+// Returns the updated member. An upgrade (to request.to_category) gives a
+// number in that category's series; the old number is retired (reserved for
+// good) and returned as updated.previous_membership_number.
 async function applyRenewal(client, member, request, settings, upgradeNumber) {
   const updates = {};
   if (request.kind === 'upgrade') {
-    updates.category = 'LT';
-    updates.valid_until = null;
+    const to = request.to_category;
+    if (!M.UPGRADES[member.category].includes(to)) {
+      throw validationError(`${M.CATEGORIES[member.category]} cannot be upgraded to ${M.CATEGORIES[to] || to}.`);
+    }
+    updates.category = to;
+    updates.valid_until = M.upgradedValidUntil(member, to, settings);
     updates.membership_number = upgradeNumber
-      ? await checkMembershipNumber(client, upgradeNumber, 'LT', member.id)
-      : await M.suggestMembershipNumber('LT', M.today(), client);
+      ? await checkMembershipNumber(client, upgradeNumber, to, member.id)
+      : await M.suggestMembershipNumber(to, M.today(), client);
     await client.query(
       "INSERT INTO retired_membership_numbers (membership_number, member_id, reason) VALUES ($1, $2, 'upgrade') ON CONFLICT DO NOTHING",
       [member.membership_number, member.id]
@@ -772,7 +764,7 @@ router.get('/renewals/:id/receipt', async (req, res, next) => {
 const REVIEW_FIELDS = {
   status: { type: 'enum', label: 'Decision', required: true, values: ['verified', 'rejected'] },
   status_note: { type: 'text', label: 'Message to the member', max: 2000 },
-  membership_number: { type: 'text', label: 'New Lifetime membership number', max: 30 },
+  membership_number: { type: 'text', label: 'New membership number', max: 30 },
 };
 
 router.patch('/renewals/:id', form, async (req, res, next) => {
@@ -810,15 +802,44 @@ router.patch('/renewals/:id', form, async (req, res, next) => {
 
 const PAYMENT_FIELDS = {
   kind: { type: 'enum', label: 'Payment for', required: true, values: ['renewal', 'upgrade'] },
+  to_category: { type: 'enum', label: 'Upgrade to', values: M.CATEGORY_KEYS },
   amount: { type: 'number', label: 'Amount', required: true, min: 0 },
   payment_date: { type: 'date', label: 'Payment date', required: true },
-  payment_reference: { type: 'text', label: 'Receipt / reference number', required: true, max: 60 },
+  payment_reference: { type: 'text', label: 'Receipt / reference number', max: 60 },
   status_note: { type: 'text', label: 'Note', max: 2000 },
-  membership_number: { type: 'text', label: 'New Lifetime membership number', max: 30 },
+  membership_number: { type: 'text', label: 'New membership number', max: 30 },
 };
 
-// Records a payment taken outside the website (cash at an event, a bank slip
-// handed in) and applies it immediately.
+// Renews or upgrades a member with a payment taken outside the website (cash
+// at an event, a bank slip handed in), verified straight away. Inside a transaction.
+async function recordPayment(client, member, values, settings, userId) {
+  if (member.category === 'LT') throw validationError('Lifetime members do not pay renewals.');
+  const pending = (await client.query("SELECT 1 FROM renewal_requests WHERE member_id = $1 AND status = 'pending'", [member.id])).rows[0];
+  if (pending) throw validationError('This member has a renewal waiting for verification. Verify or reject it first.');
+
+  const request = {
+    // An upgrade names its category (Lifetime if left out); applyRenewal checks it's allowed.
+    kind: values.kind, from_category: member.category, to_category: values.kind === 'upgrade' ? values.to_category || 'LT' : member.category,
+  };
+  // No receipt number given: use the same style as online renewals (GM000326-2611).
+  values.payment_reference = values.payment_reference || M.paymentReference(member);
+  const updated = await applyRenewal(client, member, request, settings, values.membership_number);
+  const row = (await client.query(
+    `INSERT INTO renewal_requests (member_id, kind, from_category, to_category, amount, payment_reference, payment_date,
+       status, status_note, previous_valid_until, new_valid_until, recorded_by_admin, reviewed_by, reviewed_at, previous_membership_number)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'verified', $8, $9, $10, true, $11, now(), $12) RETURNING *`,
+    [member.id, request.kind, request.from_category, request.to_category, values.amount, values.payment_reference,
+      values.payment_date, values.status_note, member.valid_until, updated.valid_until, userId,
+      updated.previous_membership_number || null]
+  )).rows[0];
+  return { request: row, member: updated };
+}
+
+function paymentEmails(result, username) {
+  sendMailInBackground(emails.renewalReviewed(result.member, result.request));
+  sendMailInBackground(emails.secretaryRenewalVerified(result.member, result.request, username));
+}
+
 router.post('/members/:id/payments', form, async (req, res, next) => {
   try {
     const values = parseFields(req.body, PAYMENT_FIELDS);
@@ -826,27 +847,31 @@ router.post('/members/:id/payments', form, async (req, res, next) => {
     const result = await withTransaction(async (client) => {
       const member = await getMember(parseId(req.params.id), client);
       if (!member) throw Object.assign(new Error('Member not found.'), { statusCode: 404 });
-      if (member.category === 'LT') throw validationError('Lifetime members do not pay renewals.');
-      const pending = (await client.query("SELECT 1 FROM renewal_requests WHERE member_id = $1 AND status = 'pending'", [member.id])).rows[0];
-      if (pending) throw validationError('This member has a renewal waiting for verification. Verify or reject it first.');
-
-      const request = {
-        kind: values.kind, from_category: member.category, to_category: values.kind === 'upgrade' ? 'LT' : member.category,
-      };
-      const updated = await applyRenewal(client, member, request, settings, values.membership_number);
-      const row = (await client.query(
-        `INSERT INTO renewal_requests (member_id, kind, from_category, to_category, amount, payment_reference, payment_date,
-           status, status_note, previous_valid_until, new_valid_until, recorded_by_admin, reviewed_by, reviewed_at, previous_membership_number)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'verified', $8, $9, $10, true, $11, now(), $12) RETURNING *`,
-        [member.id, request.kind, request.from_category, request.to_category, values.amount, values.payment_reference,
-          values.payment_date, values.status_note, member.valid_until, updated.valid_until, req.user.id,
-          updated.previous_membership_number || null]
-      )).rows[0];
-      return { request: row, member: updated };
+      return recordPayment(client, member, values, settings, req.user.id);
     });
-    sendMailInBackground(emails.renewalReviewed(result.member, result.request));
-    sendMailInBackground(emails.secretaryRenewalVerified(result.member, result.request, req.user.username));
+    paymentEmails(result, req.user.username);
     res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Reactivates a member; with kind = renewal | upgrade (and the payment fields)
+// it also records that payment, all in one step.
+router.post('/members/:id/reactivate', form, async (req, res, next) => {
+  try {
+    const values = req.body.kind ? parseFields(req.body, PAYMENT_FIELDS) : null;
+    const settings = await M.loadSettings();
+    const result = await withTransaction(async (client) => {
+      const row = (await client.query(
+        'UPDATE members SET is_active = true, deactivated_reason = NULL, deactivated_at = NULL, updated_at = now() WHERE id = $1 RETURNING *',
+        [parseId(req.params.id)]
+      )).rows[0];
+      if (!row) throw Object.assign(new Error('Member not found.'), { statusCode: 404 });
+      return values ? recordPayment(client, row, values, settings, req.user.id) : null;
+    });
+    if (result) paymentEmails(result, req.user.username);
+    res.json({ success: true, ...(result || {}) });
   } catch (err) {
     next(err);
   }
@@ -857,7 +882,7 @@ router.post('/members/:id/payments', form, async (req, res, next) => {
 router.get('/settings', async (req, res, next) => {
   try {
     const [fees, settings] = await Promise.all([M.loadFees(), M.loadSettings()]);
-    res.json({ fees: Object.values(fees), bank: settings.bank, grace_days: settings.graceDays, notice_days: settings.noticeDays, email_configured: emailConfigured() });
+    res.json({ fees: Object.values(fees), bank: settings.bank, event_bank: settings.eventBank, grace_days: settings.graceDays, notice_days: settings.noticeDays, email_configured: emailConfigured() });
   } catch (err) {
     next(err);
   }
@@ -871,6 +896,12 @@ const SETTINGS_GROUPS = {
     bank_account_number: { type: 'text', label: 'Account number', required: true, max: 50 },
     bank_branch: { type: 'text', label: 'Branch', required: true, max: 100 },
     bank_account_name: { type: 'text', label: 'Account name', required: true, max: 200 },
+  },
+  event_bank: {
+    event_bank_name: { type: 'text', label: 'Bank', required: true, max: 100 },
+    event_bank_account_number: { type: 'text', label: 'Account number', required: true, max: 50 },
+    event_bank_branch: { type: 'text', label: 'Branch', required: true, max: 100 },
+    event_bank_account_name: { type: 'text', label: 'Account name', required: true, max: 200 },
   },
   renewals: {
     membership_grace_days: { type: 'int', label: 'Grace period (days)', required: true, min: 0, max: 365 },

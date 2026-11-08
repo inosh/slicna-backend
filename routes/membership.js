@@ -2,8 +2,8 @@
 // Public membership endpoints (no login):
 //   GET  /api/membership/info              fees, bank details, grace period
 //   POST /api/membership/applications      submit an application (multipart)
-//   POST /api/membership/status            check an application (reference + NIC)
-//   POST /api/membership/renew/lookup      membership number + NIC -> renewal token
+//   POST /api/membership/status            check an application (reference or NIC)
+//   POST /api/membership/renew/lookup      membership number -> renewal token
 //   GET  /api/membership/renew/:token      what the renewal page shows
 //   POST /api/membership/renew/:token      submit a renewal or upgrade (multipart)
 
@@ -203,14 +203,19 @@ const STATUS_MESSAGES = {
 
 router.post('/status', lookupLimiter, async (req, res, next) => {
   try {
-    const reference = String(req.body.reference_number || '').trim().toUpperCase();
-    const nic = M.normaliseNic(req.body.nic_number);
-    const notFound = () => res.status(404).json({ error: 'No application matches that reference number and NIC. Please check both and try again.' });
-    if (!reference || !nic) return notFound();
+    // One value: the application reference (LT-20261106-7KQ2M9) or the NIC.
+    // For an NIC with several applications (reapplied after a rejection), the latest.
+    // Rate limited like every lookup here (20 tries per 15 minutes).
+    const value = String(req.body.lookup || req.body.reference_number || req.body.nic_number || '').trim().toUpperCase();
+    const notFound = () => res.status(404).json({ error: 'No application matches that reference number or NIC. Please check it and try again.' });
+    if (!value) return notFound();
 
+    const isReference = /^[A-Z]{2}-\d{8}-[A-Z0-9]{6}$/.test(value.replace(/\s/g, ''));
     const app = (await pool.query(
-      'SELECT * FROM membership_applications WHERE reference_number = $1 AND upper(nic_number) = $2',
-      [reference, nic]
+      isReference
+        ? 'SELECT * FROM membership_applications WHERE reference_number = $1'
+        : 'SELECT * FROM membership_applications WHERE upper(nic_number) = ANY($1) ORDER BY created_at DESC LIMIT 1',
+      [isReference ? value.replace(/\s/g, '') : M.nicVariants(value)]
     )).rows[0];
     if (!app) return notFound();
 
@@ -239,22 +244,24 @@ router.post('/status', lookupLimiter, async (req, res, next) => {
 
 router.post('/renew/lookup', lookupLimiter, async (req, res, next) => {
   try {
-    const number = M.compactNumber(req.body.membership_number);
-    const nic = M.normaliseNic(req.body.nic_number);
-    // Either NIC format matches (old 9 digits + V/X, or new 12 digits).
-    const member = number && nic
-      ? (await pool.query(
-        "SELECT id FROM members WHERE regexp_replace(upper(membership_number), '[^A-Z0-9]', '', 'g') = $1 AND upper(nic_number) = ANY($2)",
-        [number, M.nicVariants(nic)]
-      )).rows[0]
-      : null;
-    if (!member) return res.status(404).json({ error: 'No member matches that membership number and NIC. Please check both and try again.' });
-    res.json({ token: await M.createRenewalToken(member.id, 1) });
+    // The membership number alone: members who joined before the website have
+    // no NIC on record. The page then hides their contact details (see renewalView).
+    // The year may be left out ("GM 0003") when only one member has that number.
+    const member = await M.findMemberByNumber(req.body.membership_number);
+    if (!member) return res.status(404).json({ error: 'No member has that membership number. Please check it and try again.' });
+    res.json({ token: await M.createRenewalToken(member.id, 1, undefined, { viaLookup: true }) });
   } catch (err) {
     next(err);
   }
 });
 
+// "in•••@gmail.com", "071•••••68": enough to recognise, not to read.
+const maskEmail = (e) => (e ? e.replace(/^(.{1,2})[^@]*(@.*)$/, '$1•••$2') : null);
+const maskPhone = (p) => (p ? p.slice(0, 3) + '•'.repeat(Math.max(p.length - 5, 0)) + p.slice(-2) : null);
+
+// A personal link (emailed, or made by an admin) shows the member's contact
+// details to check. A number typed on the renewal page could be anyone's, so
+// then they are only hinted at, and the member types new ones if they changed.
 async function renewalView(member) {
   const [settings, fees] = await Promise.all([M.loadSettings(), M.loadFees()]);
   const state = M.memberState(member, settings);
@@ -272,15 +279,22 @@ async function renewalView(member) {
       valid_until: member.valid_until,
       state,
       state_label: M.STATE_LABELS[state],
-      email: member.email,
-      mobile: member.mobile,
-      current_working_place: member.current_working_place,
+      email: member.via_lookup ? null : member.email,
+      mobile: member.via_lookup ? null : member.mobile,
+      current_working_place: member.via_lookup ? null : member.current_working_place,
+      contact_hidden: Boolean(member.via_lookup),
+      email_hint: member.via_lookup ? maskEmail(member.email) : null,
+      mobile_hint: member.via_lookup ? maskPhone(member.mobile) : null,
     },
     renewal: isLifetime || state === 'deactivated' ? null : {
       amount: fees[member.category].amount,
       new_valid_until: M.renewedValidUntil(member, settings),
     },
-    upgrade: isLifetime || state === 'deactivated' ? null : { to_category: 'LT', label: M.CATEGORIES.LT, amount: fees.LT.amount },
+    // The categories this member can upgrade to (cheapest first), each at that category's fee.
+    upgrades: state === 'deactivated' ? [] : M.UPGRADES[member.category].map((to) => ({
+      to_category: to, label: M.CATEGORIES[to], amount: fees[to].amount,
+      new_valid_until: M.upgradedValidUntil(member, to, settings),
+    })),
     payment_reference: M.paymentReference(member),
     latest_request: latest,
     bank: settings.bank,
@@ -290,7 +304,7 @@ async function renewalView(member) {
 router.get('/renew/:token', lookupLimiter, async (req, res, next) => {
   try {
     const member = await M.memberForToken(req.params.token);
-    if (!member) return res.status(404).json({ error: 'This renewal link has expired or is not valid. You can still renew with your membership number and NIC.' });
+    if (!member) return res.status(404).json({ error: 'This renewal link has expired or is not valid. You can still renew with your membership number.' });
     res.json(await renewalView(member));
   } catch (err) {
     next(err);
@@ -299,7 +313,7 @@ router.get('/renew/:token', lookupLimiter, async (req, res, next) => {
 
 const RENEWAL_FIELDS = {
   kind: { type: 'enum', label: 'Renewal type', required: true, values: ['renewal', 'upgrade'] },
-  nic_number: { type: 'text', label: 'NIC number', required: true, max: 20 },
+  to_category: { type: 'enum', label: 'Upgrade to', values: M.CATEGORY_KEYS },
   email: { type: 'text', label: 'Email', max: 255 },
   mobile: { type: 'text', label: 'Mobile number', max: 30 },
   current_working_place: { type: 'text', label: 'Current working place', max: 255 },
@@ -331,17 +345,18 @@ router.post(
     const member = req.renewalMember;
     try {
       const values = parseFields(req.body, RENEWAL_FIELDS);
-      const upgrade = values.kind === 'upgrade'
+      const view = await renewalView(member);
+      // An upgrade names its category (Lifetime if left out, as before upgrades to GM/OM existed).
+      const target = values.kind === 'upgrade' ? view.upgrades.find((u) => u.to_category === (values.to_category || 'LT')) : null;
+      if (values.kind === 'upgrade' && !target) throw validationError('This membership cannot be upgraded to that category.');
+      const upgrade = target && target.to_category === 'LT'
         ? parseFields(req.body, UPGRADE_FIELDS)
         : { icu_training_batch: null, icu_training_type: null, icu_training_year: null };
-      if (!M.nicMatches(member.nic_number, values.nic_number)) throw validationError('This NIC number does not match our records for this membership.');
       if (!uploadedKey(req, 'receipt')) throw validationError('Please upload your payment slip or receipt.');
       values.mobile = M.checkPhone(values.mobile, 'mobile', 'Mobile number');
       if (values.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(values.email)) throw validationError('Please enter a valid email address.');
 
-      const view = await renewalView(member);
       if (values.kind === 'renewal' && !view.renewal) throw validationError('This membership does not need renewing.');
-      if (values.kind === 'upgrade' && !view.upgrade) throw validationError('This membership cannot be upgraded.');
       const pending = (await pool.query("SELECT 1 FROM renewal_requests WHERE member_id = $1 AND status = 'pending'", [member.id])).rows[0];
       if (pending) throw validationError('Your previous renewal is still being verified. You will hear from us soon.');
 
@@ -351,8 +366,8 @@ router.post(
            icu_training_batch, icu_training_type, icu_training_year)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING *`,
         [
-          member.id, values.kind, member.category, values.kind === 'upgrade' ? 'LT' : member.category,
-          values.kind === 'upgrade' ? view.upgrade.amount : view.renewal.amount, view.payment_reference, values.payment_date,
+          member.id, values.kind, member.category, target ? target.to_category : member.category,
+          target ? target.amount : view.renewal.amount, view.payment_reference, values.payment_date,
           uploadedKey(req, 'receipt'), values.email, values.mobile, values.current_working_place, member.valid_until,
           upgrade.icu_training_batch, upgrade.icu_training_type, upgrade.icu_training_year,
         ]

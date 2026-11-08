@@ -64,10 +64,10 @@ Two kinds of event (`category`): **CPD events** (Workshop, Webinar, Conference, 
 | Endpoint | Purpose |
 |---|---|
 | `GET /api/events` / `GET /api/events/:id` | Events with status, fee summary and fee per category (`fee_by_category`); one event also returns bank details when it is paid |
-| `POST /api/events/:id/member-check` | Membership number + NIC → the member's category, whether their membership counts (active, renewal due or grace period) and their fee |
+| `POST /api/events/:id/member-check` | Membership number (the year may be left out when the number is unique) → the member's category, whether their membership counts (active, renewal due or grace period) and their fee |
 | `POST /api/events/:id/registrations` | Register (multipart). Members are checked against the member register and pay their category's fee. Paid registrations need `pay_by`, `payment_date` and `receipt` (image/PDF). One live registration per NIC per event. Returns a reference like `REG-7KQ2M9XA` |
 
-**Admin endpoints** are under `/api/events/admin/*`: add, edit and delete events (`photo` image and `attachment` PDF; events with registrations can't be deleted), review registrations (confirm, reject with a reason, back to pending, delete, payment slip), counts per status, an Excel file and a PDF of an event's registrations (same columns and order, filtered by status as in SLNA). See the header comment in `routes/events-admin.js`.
+**Admin endpoints** are under `/api/events/admin/*`: add, edit and delete events (`photo` image and `attachment` brochure, a PDF or an image; events with registrations can't be deleted), review registrations (confirm, reject with a reason, back to pending, delete, payment slip), counts per status, an Excel file and a PDF of an event's registrations (same columns and order, filtered by status as in SLNA). See the header comment in `routes/events-admin.js`.
 
 Registration payment slips are private: `private-uploads/events/<event id>/registrations/<reference>/receipt-…`.
 
@@ -81,19 +81,19 @@ Four categories: **LT** Lifetime (paid once, never expires), **GM** General, **O
 |---|---|
 | `GET /api/membership/info` | Fees, bank details, grace period |
 | `POST /api/membership/applications` | Apply (multipart). Files: `photo` (image), `receipt` (image/PDF). No recommendation or certification is needed for any category. Returns a reference like `LT-20261106-7KQ2M9` (category, date applied, code) |
-| `POST /api/membership/status` | Application status from reference + NIC |
-| `POST /api/membership/renew/lookup` | Membership number + NIC → short-lived renewal token |
-| `GET /api/membership/renew/:token` | What the renewal page shows |
-| `POST /api/membership/renew/:token` | Submit a renewal or upgrade (`kind`, `nic_number` (old or new format), `payment_date`, `receipt`, optional contact updates; for an upgrade also the ICU training details) |
+| `POST /api/membership/status` | Application status from the reference number or the NIC (`lookup`); the latest application for an NIC |
+| `POST /api/membership/renew/lookup` | Membership number → short-lived renewal token (no NIC: older members have none on record). The year may be left out (`GM 0003`) when only one member has that serial |
+| `GET /api/membership/renew/:token` | What the renewal page shows. After a number lookup the contact details are only hinted at (`in•••@gmail.com`); a personal link shows them in full |
+| `POST /api/membership/renew/:token` | Submit a renewal or upgrade (`kind`, `to_category` for an upgrade, `payment_date`, `receipt`, optional contact updates; for an upgrade to Lifetime also the ICU training details) |
 
-**Admin endpoints** are under `/api/membership/admin/*` (all need a login): applications review, member directory (add, edit, Excel download, deactivate/reactivate, renewal links, recording cash payments), ID applications for approved applications, renewals verification, fees, bank details and reminder settings. See the header comment in `routes/membership-admin.js` for the full list.
+**Admin endpoints** are under `/api/membership/admin/*` (all need a login): applications review, member directory (add, edit, Excel download, deactivate/reactivate (optionally renewing or upgrading in the same step), renewal reminders, Renew / Upgrade with a payment received offline), ID applications for approved applications, renewals verification, fees, bank details and reminder settings. See the header comment in `routes/membership-admin.js` for the full list.
 
 **How the lifecycle works:**
 - **Approval:** creates a member with a membership number (suggested as `GM 0012/26`: category, 4-digit serial, year). Memberships start on the day the application was submitted. For GM/OM/PM the admin may confirm a different start date, and the membership is valid for one year from it. Lifetime members never expire.
 - **Application statuses:** pending → approved or rejected, with "more info needed" while waiting on the applicant (and back to pending when it arrives).
 - **Application form rules:** every field on the paper forms is required except WhatsApp, residential and office phones and higher qualifications (the same optional fields as SLNA's join form). SLNC and SLNA numbers and dates are required unless the applicant ticks "I don't have it yet". Titles, marital statuses and phone rules match SLNA's join form.
 - **Status:** each member's status (active, renewal due, grace period, lapsed) is **calculated from `valid_until` and the grace setting**, so lapsing happens automatically without a job. Deactivation is a manual admin action.
-- **Renewal before the grace period ends:** extends from the old expiry date. **Renewal after lapsing:** starts a new year from the verification date. Upgrades make the member Lifetime with a new LT number.
+- **Renewal before the grace period ends:** extends from the old expiry date. **Renewal after lapsing:** starts a new year from the verification date. **Upgrades:** GM → LT; OM → GM or LT; PM → OM, GM or LT, at the new category's fee. The member gets a number in the new category's series (the old one stays reserved). Upgrades to GM or OM run for 12 months with the same dates as a renewal; Lifetime never expires.
 - **Reminders:** `npm run reminders` sends at most one reminder per stage and period, with a fresh personal renewal link: 30 and 7 days before expiry, on expiry, 14 days before the grace period ends, and on lapsing. Members with a pending renewal are skipped.
 
 **Private files:** application photos, payment slips, signed pages and renewal slips are stored in `private-uploads/` (never served publicly; streamed only to logged-in admins). Keys mirror a future R2 private bucket:

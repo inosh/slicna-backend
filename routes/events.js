@@ -42,7 +42,7 @@ router.get('/:id', async (req, res, next) => {
     const event = await getEvent(parseId(req.params.id));
     if (!event) return res.status(404).json({ error: 'Event not found.' });
     const result = E.publicEvent(event, M.today());
-    if (result.fees.some((f) => f.amount > 0)) result.bank = (await M.loadSettings()).bank;
+    if (result.fees.some((f) => f.amount > 0)) result.bank = (await M.loadSettings()).eventBank;
     res.json(result);
   } catch (err) {
     next(err);
@@ -51,19 +51,12 @@ router.get('/:id', async (req, res, next) => {
 
 // ---------- Members ----------
 
-// The member with this number and NIC, or null.
-// Members are identified by membership number alone: records of members who
-// joined before the website have no NIC, and some aren't in the register yet.
-async function findMember(number) {
-  const compact = M.compactNumber(number);
-  if (!compact) return null;
-  return (await pool.query(
-    "SELECT * FROM members WHERE regexp_replace(upper(membership_number), '[^A-Z0-9]', '', 'g') = $1",
-    [compact]
-  )).rows[0] || null;
-}
-
-const NUMBER_FORMAT = 'Please enter your membership number like GM 0012/25 (LT, GM, OM or PM, the number and the year).';
+// Members are found by membership number alone (M.findMemberByNumber): older
+// records have no NIC, and some members aren't in the register yet. The year
+// may be left out when only one member has that number.
+const NUMBER_FORMAT = 'Please enter your membership number like GM 0012/25 (LT, GM, OM or PM and the number; the year is optional).';
+// A number not in the register is accepted at its category's fee, but then the year is needed to record it.
+const needYear = (parsed) => `We couldn't find ${parsed.serial} in our register. Please add the year from your membership card, for example ${parsed.serial}/25.`;
 
 // What a member pays for this event, or why they can't use the member rate.
 async function memberQuote(event, member) {
@@ -94,8 +87,9 @@ router.post('/:id/member-check', lookupLimiter, async (req, res, next) => {
     if (!event || event.category !== 'cpd') return res.status(404).json({ error: 'Event not found.' });
     const parsed = M.parseMembershipNumber(req.body.membership_number);
     if (!parsed) return res.status(400).json({ error: NUMBER_FORMAT });
-    const member = await findMember(parsed.number);
+    const member = await M.findMemberByNumber(req.body.membership_number);
     if (member) return res.json(await memberQuote(event, member));
+    if (!parsed.number) return res.status(400).json({ error: needYear(parsed) });
     // Not in the register (yet): the prefix gives the category and the fee; SLICNA checks it later.
     res.json({
       found: false,
@@ -121,6 +115,7 @@ const REGISTRATION_FIELDS = {
   certificate_name: { type: 'text', label: 'Name on the certificate', required: true, max: 255 },
   nic_number: { type: 'text', label: 'NIC number', required: true, max: 20 },
   slnc_number: { type: 'text', label: 'SLNC registration number', max: 50 },
+  country: { type: 'text', label: 'Country', max: 100 },
   email: { type: 'text', label: 'Email', required: true, max: 255 },
   mobile: { type: 'text', label: 'Mobile number', required: true, max: 30 },
   postal_address: { type: 'text', label: 'Postal address', required: true, max: 500 },
@@ -150,9 +145,19 @@ router.post(
       if (!E.registrationOpen(event, M.today())) throw validationError('Registration for this event is not open.');
 
       const values = parseFields(req.body, REGISTRATION_FIELDS);
+      const foreign = req.body.registrant_type === 'foreign';
       values.nic_number = M.normaliseNic(values.nic_number);
-      if (!M.isValidNic(values.nic_number)) throw validationError('Please enter a valid NIC number (9 digits with V or X, or 12 digits).');
-      values.mobile = M.checkPhone(values.mobile, 'mobile', 'Mobile number');
+      if (foreign) {
+        // Foreign participants: passport number (in nic_number), country and an international mobile number.
+        if (!/^[A-Z0-9-]{5,20}$/.test(values.nic_number)) throw validationError('Please enter a valid passport number (letters and numbers only).');
+        if (!values.country) throw validationError('Please enter your country.');
+        values.mobile = String(values.mobile).replace(/[\s()-]/g, '');
+        if (!/^\+?\d{7,15}$/.test(values.mobile)) throw validationError('Please enter your mobile number with the country code, for example +960 7771234.');
+      } else {
+        if (!M.isValidNic(values.nic_number)) throw validationError('Please enter a valid NIC number (9 digits with V or X, or 12 digits).');
+        values.mobile = M.checkPhone(values.mobile, 'mobile', 'Mobile number');
+        values.country = null;
+      }
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(values.email)) throw validationError('Please enter a valid email address.');
 
       // Members are checked against the register; their fee follows their category.
@@ -163,13 +168,19 @@ router.post(
       if (req.body.registrant_type === 'member') {
         const parsed = M.parseMembershipNumber(req.body.membership_number);
         if (!parsed) throw validationError(NUMBER_FORMAT);
-        member = await findMember(parsed.number);
+        member = await M.findMemberByNumber(req.body.membership_number);
+        if (!member && !parsed.number) throw validationError(needYear(parsed));
         if (member) {
           const quote = await memberQuote(event, member);
           if (!quote.eligible) throw validationError(quote.message);
         }
         feeCategory = member ? member.category : parsed.category;
         membershipNumber = member ? member.membership_number : parsed.number;
+      } else if (foreign) {
+        // Attending online (FO) or physically (FP).
+        feeCategory = req.body.attendance === 'physical' ? 'FP' : req.body.attendance === 'online' ? 'FO' : null;
+        if (!feeCategory) throw validationError('Please choose whether you will attend online or physically.');
+        if (E.feeFor(event, feeCategory) === null) throw validationError(`Foreign participants can't attend this event ${req.body.attendance === 'physical' ? 'physically' : 'online'}.`);
       } else if (req.body.registrant_type !== 'non_member') {
         throw validationError('Please choose whether you are registering as a member or a non-member.');
       }
@@ -192,11 +203,12 @@ router.post(
         event_id: event.id,
         event_title: event.title,
         event_date: event.event_date,
-        registrant_type: membershipNumber ? 'member' : 'non_member',
+        registrant_type: foreign ? 'foreign' : membershipNumber ? 'member' : 'non_member',
         member_id: member ? member.id : null,
         membership_number: membershipNumber,
         fee_category: feeCategory,
         amount_due: amountDue,
+        currency: foreign ? 'USD' : 'LKR',
         ...values,
         ...payment,
         receipt_key: amountDue > 0 ? receiptKey : null,
@@ -214,7 +226,7 @@ router.post(
           "SELECT reference_number FROM event_registrations WHERE event_id = $1 AND upper(nic_number) = $2 AND status <> 'rejected'",
           [event.id, values.nic_number]
         )).rows[0];
-        throw Object.assign(new Error(`This NIC is already registered for this event${existing ? ` (reference ${existing.reference_number})` : ''}.`), { statusCode: 409 });
+        throw Object.assign(new Error(`This ${foreign ? 'passport number' : 'NIC'} is already registered for this event${existing ? ` (reference ${existing.reference_number})` : ''}.`), { statusCode: 409 });
       }
 
       sendMailInBackground(emails.registrationReceived(saved));
@@ -222,6 +234,7 @@ router.post(
       res.status(201).json({
         reference_number: saved.reference_number,
         amount_due: saved.amount_due,
+        currency: saved.currency,
         event_title: saved.event_title,
         email: saved.email,
       });

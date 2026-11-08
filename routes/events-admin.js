@@ -5,8 +5,9 @@
 //   GET    /overview                              registrations waiting for review
 //   Events
 //   GET    /events                                every event with registration counts
-//   POST   /events                                add (multipart: photo, attachment PDF)
+//   POST   /events                                add (multipart: photo, attachment PDF or image)
 //   PUT    /events/:id                            edit (remove_image / remove_attachment)
+//   PATCH  /events/:id/status                     open registration (from opening soon) or close it
 //   DELETE /events/:id                            delete (only without registrations)
 //   GET    /events/:id/registrations.xlsx?status=  Excel download (same rows as the PDF)
 //   GET    /events/:id/registrations.pdf?status=   PDF download (A3 table)
@@ -41,11 +42,11 @@ router.use(requireAuth);
 const form = multer().none();
 const notFound = (res, what = 'Not found.') => res.status(404).json({ error: what });
 
-// ---------- Event uploads: a photo (public image) and an optional PDF ----------
+// ---------- Event uploads: a photo (public image) and an optional brochure (PDF or image) ----------
 
 const UPLOAD_TYPES = {
   photo: ['image/jpeg', 'image/png', 'image/webp', 'image/gif'],
-  attachment: ['application/pdf'],
+  attachment: ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'],
 };
 const eventUpload = multer({
   storage: multer.diskStorage({
@@ -60,9 +61,9 @@ const eventUpload = multer({
   }),
   fileFilter(req, file, cb) {
     const types = UPLOAD_TYPES[file.fieldname];
-    if (!types) return cb(new Error('Unexpected upload field: ' + file.fieldname + '. Only listed files are allowed.'));
+    if (!types) return cb(Object.assign(new Error('Unexpected upload field: ' + file.fieldname + '. Only listed files are allowed.'), { statusCode: 400 }));
     if (!types.includes(file.mimetype)) {
-      return cb(new Error(file.fieldname === 'photo' ? 'For the photo, only JPEG, PNG, WEBP or GIF images are allowed.' : 'For the attachment, only PDF files are allowed.'));
+      return cb(Object.assign(new Error(file.fieldname === 'photo' ? 'For the photo, only JPEG, PNG, WEBP or GIF images are allowed.' : 'For the programme or brochure, only a PDF or a JPEG, PNG or WEBP image is allowed.'), { statusCode: 400 }));
     }
     cb(null, true);
   },
@@ -81,11 +82,18 @@ const EVENT_FIELDS = {
   event_type: { type: 'text', label: 'Type', required: true, max: 60 },
   status: { type: 'text', label: 'Status', required: true, max: 20 },
   event_date: { type: 'date', label: 'Date', required: true },
-  end_date: { type: 'date', label: 'End date' },
+  duration_number: { type: 'int', label: 'Duration', min: 1, max: 366, default: 1 },
+  duration_unit: { type: 'enum', label: 'Duration unit', values: Object.keys(E.DURATION_UNITS), default: 'day' },
+  end_date: { type: 'date', label: 'Exact end date' },
+  start_time: { type: 'text', label: 'Start time', max: 5 },
+  end_time: { type: 'text', label: 'End time', max: 5 },
   time_text: { type: 'text', label: 'Time', max: 100 },
+  registration_mode: { type: 'enum', label: 'Registration', values: ['online', 'external', 'none'], default: 'online' },
+  registration_url: { type: 'text', label: 'Registration link', max: 500 },
+  join_url: { type: 'text', label: 'Meeting link', max: 500 },
   location: { type: 'text', label: 'Venue', max: 300 },
   summary: { type: 'text', label: 'Summary', max: 1000 },
-  body: { type: 'text', label: 'Details', max: 20000 },
+  body: { type: 'text', label: 'Details', max: 100000 },
   cpd_points: { type: 'number', label: 'CPD points', min: 0, max: 100 },
   audience: { type: 'enum', label: 'Audience', values: Object.keys(E.AUDIENCES), default: 'public' },
   fee_type: { type: 'enum', label: 'Fee', values: ['free', 'paid'], default: 'free' },
@@ -96,14 +104,41 @@ const EVENT_FIELDS = {
   fee_om: { ...money, label: 'Ordinary member fee' },
   fee_pm: { ...money, label: 'Partial member fee' },
   non_member_fee: { ...money, label: 'Non-member fee' },
+  foreign_online: { type: 'enum', label: 'Foreign participants online', values: ['true', 'false'], default: 'false' },
+  foreign_physical: { type: 'enum', label: 'Foreign participants physical', values: ['true', 'false'], default: 'false' },
+  foreign_fee_online: { ...money, label: 'Foreign participant fee (online)' },
+  foreign_fee_physical: { ...money, label: 'Foreign participant fee (physical)' },
 };
 const FEE_COLUMNS = ['member_fee', 'fee_lt', 'fee_gm', 'fee_om', 'fee_pm', 'non_member_fee'];
 
 // Clean values for one event: the type and status must fit the kind; only
 // the fee columns the chosen pricing uses are kept (the rest are cleared).
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+const URL_RE = /^https?:\/\/\S+$/i;
+
 function eventValues(body) {
   const v = parseFields(body, EVENT_FIELDS);
   if (v.end_date && v.end_date < v.event_date) throw validationError('End date cannot be before the start date.');
+  // Time: a start (and end) time, or free text instead.
+  if (v.time_text) {
+    v.start_time = null;
+    v.end_time = null;
+  } else {
+    if (v.start_time && !TIME_RE.test(v.start_time)) throw validationError('Please choose a valid start time.');
+    if (v.end_time && !TIME_RE.test(v.end_time)) throw validationError('Please choose a valid end time.');
+    if (v.end_time && !v.start_time) throw validationError('Please choose a start time as well.');
+  }
+  // Registration: on this site, on another site (a link), or none (an open meeting).
+  if (v.category !== 'cpd') v.registration_mode = 'online';
+  if (v.registration_url && !URL_RE.test(v.registration_url)) throw validationError('The registration link must start with http:// or https://.');
+  if (v.join_url && !URL_RE.test(v.join_url)) throw validationError('The meeting link must start with http:// or https://.');
+  if (v.registration_mode === 'external' && !v.registration_url) throw validationError('Please add the registration link.');
+  if (v.registration_mode !== 'external') v.registration_url = null;
+  if (v.registration_mode === 'none') {
+    // Nothing to open or close, and no fees.
+    v.status = 'open';
+    v.fee_type = 'free';
+  }
   if (!E.EVENT_TYPES[v.category].includes(v.event_type)) throw validationError(`Please choose a type for this ${v.category === 'cpd' ? 'CPD event' : 'event'}.`);
   if (!E.STATUSES[v.category][v.status]) throw validationError(`Please choose a status for this ${v.category === 'cpd' ? 'CPD event' : 'event'}.`);
 
@@ -122,6 +157,19 @@ function eventValues(body) {
     v.member_pricing = 'same';
   }
   FEE_COLUMNS.forEach((col) => { if (!keep.has(col)) v[col] = null; });
+
+  // Foreign participants: CPD events open to everyone; online and/or physical,
+  // each with a USD fee when the event is paid.
+  v.foreign_online = v.foreign_online === 'true';
+  v.foreign_physical = v.foreign_physical === 'true';
+  if (v.category !== 'cpd' || v.audience !== 'public' || v.registration_mode === 'none') {
+    v.foreign_online = false;
+    v.foreign_physical = false;
+  }
+  [['foreign_online', 'foreign_fee_online', 'online'], ['foreign_physical', 'foreign_fee_physical', 'physical']].forEach(([on, fee, mode]) => {
+    if (!v[on] || v.fee_type !== 'paid') v[fee] = null;
+    else if (v[fee] === null) throw validationError(`Please enter the fee for foreign participants attending ${mode} (USD; enter 0 if it's free).`);
+  });
   return v;
 }
 
@@ -152,7 +200,11 @@ router.get('/events', async (req, res, next) => {
       ...e,
       status_label: E.isPast(e, today) ? 'Completed' : E.STATUSES[e.category][e.status],
       is_past: E.isPast(e, today),
+      is_ongoing: E.isOngoing(e, today),
+      ends_on: E.endDateOf(e), // end_date stays the exact date typed in (or null)
+      duration_text: E.durationText(e),
       fees: E.feeSummary(e),
+      foreign: E.foreignOptions(e),
     })));
   } catch (err) {
     next(err);
@@ -161,7 +213,7 @@ router.get('/events', async (req, res, next) => {
 
 // Lists for the admin form's dropdowns.
 router.get('/options', (req, res) => {
-  res.json({ kinds: E.KINDS, event_types: E.EVENT_TYPES, statuses: E.STATUSES, audiences: E.AUDIENCES });
+  res.json({ kinds: E.KINDS, event_types: E.EVENT_TYPES, statuses: E.STATUSES, audiences: E.AUDIENCES, duration_units: E.DURATION_UNITS });
 });
 
 async function saveEvent(req, res, next, existing) {
@@ -221,6 +273,29 @@ router.put('/events/:id', eventUpload, async (req, res, next) => {
   }
 });
 
+// Opens or closes registration without editing the whole event:
+// "Registration Opening Soon" -> open, and open -> closed. Upcoming CPD events only.
+const REGISTRATION_SWITCH = { open: 'opening_soon', closed: 'open' };
+
+router.patch('/events/:id/status', form, async (req, res, next) => {
+  try {
+    const status = String(req.body.status || '');
+    if (!REGISTRATION_SWITCH[status]) throw validationError('Status must be open or closed.');
+    const event = (await pool.query('SELECT * FROM events WHERE id = $1', [parseId(req.params.id)])).rows[0];
+    if (!event) return notFound(res, 'Event not found.');
+    if (event.category !== 'cpd' || E.isPast(event, M.today())) throw validationError('Only upcoming CPD events take registrations.');
+    if (event.status !== REGISTRATION_SWITCH[status]) {
+      throw validationError(status === 'open'
+        ? 'Registration can be opened only while it is "Registration Opening Soon".'
+        : 'Registration is not open, so it cannot be closed.');
+    }
+    const row = (await pool.query('UPDATE events SET status = $1, updated_at = now() WHERE id = $2 RETURNING *', [status, event.id])).rows[0];
+    res.json(row);
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.delete('/events/:id', async (req, res, next) => {
   try {
     const id = parseId(req.params.id);
@@ -275,7 +350,7 @@ router.get('/registrations', async (req, res, next) => {
     if (REG_STATUSES.includes(req.query.status)) where.push(`r.status = $${params.push(req.query.status)}`);
     res.json((await pool.query(
       `SELECT r.id, r.reference_number, r.event_id, r.event_title, r.event_date, r.registrant_type, r.membership_number, r.member_id,
-              r.fee_category, r.amount_due, r.full_name, r.nic_number, r.email, r.workplace, r.pay_by, r.receipt_key IS NOT NULL AS has_receipt,
+              r.fee_category, r.amount_due, r.currency, r.country, r.full_name, r.nic_number, r.email, r.workplace, r.pay_by, r.receipt_key IS NOT NULL AS has_receipt,
               r.status, r.created_at
        FROM event_registrations r ${whereSql(where)}
        ORDER BY CASE r.status WHEN 'pending' THEN 1 ELSE 2 END, r.created_at DESC`,

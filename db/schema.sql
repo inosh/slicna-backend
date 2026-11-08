@@ -164,6 +164,39 @@ ALTER TABLE public.events ADD CONSTRAINT events_status_check
     CHECK (status IN ('coming_soon', 'opening_soon', 'open', 'closed', 'upcoming'));
 ALTER TABLE public.events DROP CONSTRAINT IF EXISTS events_audience_check;
 ALTER TABLE public.events ADD CONSTRAINT events_audience_check CHECK (audience IN ('public', 'members'));
+
+-- How long an event runs, as on the SLNA site: a number of days, months or
+-- years from the start date (1 day by default). end_date, when set, is the
+-- exact last day and overrides the duration.
+ALTER TABLE public.events ADD COLUMN IF NOT EXISTS duration_number integer NOT NULL DEFAULT 1;
+ALTER TABLE public.events ADD COLUMN IF NOT EXISTS duration_unit character varying(10) NOT NULL DEFAULT 'day';
+ALTER TABLE public.events DROP CONSTRAINT IF EXISTS events_duration_check;
+ALTER TABLE public.events ADD CONSTRAINT events_duration_check CHECK (duration_number >= 1 AND duration_unit IN ('day', 'month', 'year'));
+
+-- Time, as on SLNA: a start and end time, or (instead) free text in time_text
+-- such as "12 PM EST".
+ALTER TABLE public.events ADD COLUMN IF NOT EXISTS start_time time;
+ALTER TABLE public.events ADD COLUMN IF NOT EXISTS end_time time;
+
+-- How people take part in a CPD event:
+--   online   - register on this website (the registration form and fees)
+--   external - register on another site (registration_url, e.g. a Google Form)
+--   none     - no registration, e.g. an open Zoom meeting (join_url)
+ALTER TABLE public.events ADD COLUMN IF NOT EXISTS registration_mode character varying(10) NOT NULL DEFAULT 'online';
+ALTER TABLE public.events ADD COLUMN IF NOT EXISTS registration_url character varying(500);
+ALTER TABLE public.events ADD COLUMN IF NOT EXISTS join_url character varying(500);
+ALTER TABLE public.events DROP CONSTRAINT IF EXISTS events_registration_mode_check;
+ALTER TABLE public.events ADD CONSTRAINT events_registration_mode_check CHECK (registration_mode IN ('online', 'external', 'none'));
+
+-- Foreign participants (CPD events open to everyone): they can attend online
+-- and/or physically, each with its own fee in US dollars (NULL on free events).
+ALTER TABLE public.events ADD COLUMN IF NOT EXISTS foreign_online boolean NOT NULL DEFAULT false;
+ALTER TABLE public.events ADD COLUMN IF NOT EXISTS foreign_physical boolean NOT NULL DEFAULT false;
+ALTER TABLE public.events ADD COLUMN IF NOT EXISTS foreign_fee_online numeric(10,2);
+ALTER TABLE public.events ADD COLUMN IF NOT EXISTS foreign_fee_physical numeric(10,2);
+-- Events saved with an end date before durations existed become a number of days.
+UPDATE public.events SET duration_number = (end_date - event_date) + 1, duration_unit = 'day', end_date = NULL
+WHERE end_date IS NOT NULL AND end_date > event_date AND duration_number = 1 AND (end_date - event_date) < 366;
 ALTER TABLE public.events DROP CONSTRAINT IF EXISTS events_fee_check;
 ALTER TABLE public.events ADD CONSTRAINT events_fee_check CHECK (
     fee_type IN ('free', 'paid') AND member_pricing IN ('same', 'by_category')
@@ -238,6 +271,23 @@ CREATE TABLE IF NOT EXISTS public.album_photos
     CONSTRAINT album_photos_album_id_fkey FOREIGN KEY (album_id)
         REFERENCES public.albums (id) ON DELETE CASCADE
 );
+
+-- Albums hold videos as well as photos (as on the SLNA site).
+ALTER TABLE public.album_photos ADD COLUMN IF NOT EXISTS media_type character varying(10) NOT NULL DEFAULT 'image';
+ALTER TABLE public.album_photos DROP CONSTRAINT IF EXISTS album_photos_media_type_check;
+ALTER TABLE public.album_photos ADD CONSTRAINT album_photos_media_type_check CHECK (media_type IN ('image', 'video'));
+
+-- A news article's photos and videos are its own album, which also appears
+-- in the Gallery. Deleting the album unlinks it; deleting the article keeps the album.
+ALTER TABLE public.news ADD COLUMN IF NOT EXISTS album_id integer;
+ALTER TABLE public.news DROP CONSTRAINT IF EXISTS news_album_id_fkey;
+ALTER TABLE public.news ADD CONSTRAINT news_album_id_fkey FOREIGN KEY (album_id) REFERENCES public.albums (id) ON DELETE SET NULL;
+
+-- Each article has a type, as on the SLNA site (for grouping news later).
+-- Keep the list in step with NEWS_TYPES in routes/news.js.
+ALTER TABLE public.news ADD COLUMN IF NOT EXISTS news_type character varying(50) NOT NULL DEFAULT 'General News';
+ALTER TABLE public.news DROP CONSTRAINT IF EXISTS news_news_type_check;
+ALTER TABLE public.news ADD CONSTRAINT news_news_type_check CHECK (news_type IN ('International Nurses Day', 'Annual General Meeting', 'General Meeting', 'CPD Event', 'Community Event', 'Awareness Program', 'Celebration', 'General News'));
 
 -- Table: public.community_sections / public.community_items
 -- The Community page is a list of sections, each drawn in one of three styles:
@@ -322,6 +372,14 @@ INSERT INTO public.site_settings (key, value) VALUES
     ('bank_account_name', 'Sri Lanka Intensive Care Nurses Association'),
     ('membership_grace_days', '30'),
     ('membership_notice_days', '30')
+ON CONFLICT (key) DO NOTHING;
+
+-- CPD event fees go to a separate account (the Educational Committee's).
+INSERT INTO public.site_settings (key, value) VALUES
+    ('event_bank_name', 'Bank of Ceylon'),
+    ('event_bank_account_number', '90453359'),
+    ('event_bank_branch', 'Regent Street, Colombo'),
+    ('event_bank_account_name', 'SLICNA Educational Committee')
 ON CONFLICT (key) DO NOTHING;
 
 -- Table: public.membership_applications
@@ -519,6 +577,12 @@ CREATE TABLE IF NOT EXISTS public.renewal_tokens
         REFERENCES public.members (id) ON DELETE CASCADE
 );
 
+-- via_lookup: made by the "Renew membership" page from a membership number
+-- alone (no NIC, since older members have none on record). Anyone could type
+-- a number, so these don't show the member's contact details.
+ALTER TABLE public.renewal_tokens
+    ADD COLUMN IF NOT EXISTS via_lookup boolean NOT NULL DEFAULT false;
+
 -- Table: public.reminder_log
 -- Every renewal reminder the daily job tried to send. A reminder kind is sent
 -- once per membership period (period_key = valid_until at the time).
@@ -543,8 +607,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS reminder_log_sent_once ON public.reminder_log 
 -- Table: public.event_registrations
 -- Online registrations for CPD events. Members are verified against the
 -- members table (membership number + NIC) and pay the fee for their
--- category; fee_category is LT / GM / OM / PM or NM (non-member) and
--- amount_due is the fee at the time of registering. event_title and
+-- category; fee_category is LT / GM / OM / PM, NM (non-member), or FO / FP
+-- (foreign participant attending online / physically) and amount_due is the
+-- fee at the time of registering, in currency (LKR, or USD for foreign
+-- participants, who give a passport number in nic_number and their country). event_title and
 -- event_date are kept so the record still reads well if the event is
 -- edited. Receipts are private files (private-uploads/events/...).
 -- status: pending -> confirmed | rejected (status_note = reason).
@@ -591,6 +657,13 @@ CREATE TABLE IF NOT EXISTS public.event_registrations
     CONSTRAINT event_registrations_pay_by_check CHECK (pay_by IS NULL OR pay_by IN ('individual', 'organisation')),
     CONSTRAINT event_registrations_status_check CHECK (status IN ('pending', 'confirmed', 'rejected'))
 );
+
+ALTER TABLE public.event_registrations ADD COLUMN IF NOT EXISTS currency character varying(3) NOT NULL DEFAULT 'LKR';
+ALTER TABLE public.event_registrations ADD COLUMN IF NOT EXISTS country character varying(100);
+ALTER TABLE public.event_registrations DROP CONSTRAINT IF EXISTS event_registrations_type_check;
+ALTER TABLE public.event_registrations ADD CONSTRAINT event_registrations_type_check CHECK (registrant_type IN ('member', 'non_member', 'foreign'));
+ALTER TABLE public.event_registrations DROP CONSTRAINT IF EXISTS event_registrations_fee_category_check;
+ALTER TABLE public.event_registrations ADD CONSTRAINT event_registrations_fee_category_check CHECK (fee_category IN ('LT', 'GM', 'OM', 'PM', 'NM', 'FO', 'FP'));
 
 CREATE INDEX IF NOT EXISTS event_registrations_event_idx ON public.event_registrations (event_id, status);
 -- One live registration per person per event (a rejected one can be redone).
