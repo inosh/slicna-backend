@@ -15,11 +15,13 @@
 //   GET    /applications/:id/id-photo             passport photo, named for the ID card
 //   POST   /applications/:id/id-application       confirm the ID application was created
 //   Members
-//   GET    /members?state=&category=&q=        directory with computed state (state=current: not deactivated)
+//   GET    /members?state=&category=&record=&q=  directory with computed state (state=current: not deactivated;
+//                                             record=legacy | full)
 //   GET    /members/counts?category=&q=        counts per status tab
 //   GET    /members/export.xlsx               Excel file of the current list
 //   GET    /members/:id                       details, renewal history, reminders
 //   POST   /members                           add a member manually (optional photo)
+//   POST   /members/legacy                    add a legacy member (number, name, dates; the rest optional)
 //   PUT    /members/:id                       edit details (optional new photo)
 //   POST   /members/:id/deactivate | /reactivate   (reactivate can renew or upgrade at the same time)
 //   GET    /members/:id/photo | /id-photo     inline | download for the ID card
@@ -74,8 +76,11 @@ async function withTransaction(fn) {
 
 // Throws a 400 if the membership number is malformed or already used by another member.
 async function checkMembershipNumber(client, number, category, exceptMemberId = null) {
-  const value = String(number || '').trim().toUpperCase().replace(/\s+/g, ' ');
-  if (!value) throw validationError('Membership number is required.');
+  const typed = String(number || '').trim().toUpperCase().replace(/\s+/g, ' ');
+  if (!typed) throw validationError('Membership number is required.');
+  // "GM/001/2023" (old cards) -> "GM 0001/23".
+  const parsed = M.parseMembershipNumber(typed);
+  const value = parsed && parsed.number ? parsed.number : typed;
   if (!value.startsWith(category)) throw validationError(`A ${M.CATEGORIES[category]} number must start with "${category}".`);
   const taken = (await client.query(
     "SELECT id FROM members WHERE regexp_replace(upper(membership_number), '[^A-Z0-9]', '', 'g') = $1 AND id IS DISTINCT FROM $2",
@@ -386,6 +391,8 @@ async function listMembers(query) {
   const where = [];
   const params = [];
   if (M.CATEGORIES[query.category]) where.push(`category = $${params.push(query.category)}`);
+  if (query.record === 'legacy') where.push("source = 'legacy'");
+  else if (query.record === 'full') where.push("source <> 'legacy'");
   if (query.q) {
     const p = params.push('%' + String(query.q).trim() + '%');
     where.push(`(full_name ILIKE $${p} OR name_with_initials ILIKE $${p} OR nic_number ILIKE $${p} OR membership_number ILIKE $${p} OR email ILIKE $${p} OR mobile ILIKE $${p}
@@ -414,7 +421,7 @@ router.get('/members', async (req, res, next) => {
 // Counts for the directory tabs, following the category and search filters.
 router.get('/members/counts', async (req, res, next) => {
   try {
-    const members = await listMembers({ category: req.query.category, q: req.query.q });
+    const members = await listMembers({ category: req.query.category, record: req.query.record, q: req.query.q });
     const counts = { current: 0, active: 0, renewal_due: 0, grace: 0, lapsed: 0, deactivated: 0, pending_renewal: 0 };
     members.forEach((m) => {
       counts[m.state] += 1;
@@ -463,7 +470,7 @@ router.get('/members/export.xlsx', async (req, res, next) => {
       date_of_birth: date(m.date_of_birth),
       joined_on: date(m.joined_on),
       valid_until: m.valid_until ? date(m.valid_until) : 'Lifetime',
-      source: m.source === 'manual' ? 'Added by admin' : 'Online application',
+      source: m.source === 'legacy' ? 'Old records' : m.source === 'manual' ? 'Added by admin' : 'Online application',
     }));
     const header = sheet.getRow(1);
     header.font = { bold: true, color: { argb: 'FFFFFFFF' } };
@@ -535,19 +542,77 @@ const MEMBER_FIELDS = {
   admin_notes: { type: 'text', label: 'Internal notes', max: 5000 },
 };
 
-async function memberValues(client, body, existingId = null) {
-  const values = parseFields(body, MEMBER_FIELDS);
-  values.nic_number = M.normaliseNic(values.nic_number);
-  if (!M.isValidNic(values.nic_number)) throw validationError('Please enter a valid NIC number (9 digits with V or X, or 12 digits).');
+// legacy: a member from the old records, whose NIC may not be known yet.
+async function memberValues(client, body, existingId = null, { legacy = false } = {}) {
+  const values = parseFields(body, legacy ? { ...MEMBER_FIELDS, nic_number: { ...MEMBER_FIELDS.nic_number, required: false } } : MEMBER_FIELDS);
+  values.nic_number = values.nic_number ? M.normaliseNic(values.nic_number) : null;
+  if (values.nic_number && !M.isValidNic(values.nic_number)) throw validationError('Please enter a valid NIC number (9 digits with V or X, or 12 digits).');
+  if (values.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(values.email)) throw validationError('Please enter a valid email address.');
   values.mobile = M.checkPhone(values.mobile, 'mobile', 'Mobile');
   values.whatsapp = M.checkPhone(values.whatsapp, 'phone', 'WhatsApp');
   values.membership_number = await checkMembershipNumber(client, values.membership_number, values.category, existingId);
   if (values.category === 'LT') values.valid_until = null;
   else if (!values.valid_until) values.valid_until = M.addYear(values.joined_on);
-  const sameNic = (await client.query('SELECT membership_number FROM members WHERE upper(nic_number) = $1 AND id IS DISTINCT FROM $2', [values.nic_number, existingId])).rows[0];
+  const sameNic = values.nic_number
+    ? (await client.query('SELECT membership_number FROM members WHERE upper(nic_number) = $1 AND id IS DISTINCT FROM $2', [values.nic_number, existingId])).rows[0]
+    : null;
   if (sameNic) throw validationError(`Another member already has this NIC (${sameNic.membership_number}).`);
   return values;
 }
+
+// Legacy member: number, category, name, the year they joined and (GM / OM / PM)
+// valid until; NIC, contact details and notes if known. Name with initials is
+// worked out from the full name when left empty ("M. G. I. MADUSHIKA").
+const LEGACY_FIELDS = {
+  category: MEMBER_FIELDS.category,
+  membership_number: MEMBER_FIELDS.membership_number,
+  full_name: MEMBER_FIELDS.full_name,
+  name_with_initials: { ...MEMBER_FIELDS.name_with_initials, required: false },
+  joined_year: { type: 'int', label: 'Member since (year)', required: true, min: 1990, max: 2100 },
+  valid_until: MEMBER_FIELDS.valid_until,
+  nic_number: { ...MEMBER_FIELDS.nic_number, required: false },
+  email: MEMBER_FIELDS.email,
+  mobile: MEMBER_FIELDS.mobile,
+  admin_notes: MEMBER_FIELDS.admin_notes,
+};
+const SURNAME_PARTICLES = new Set(['DE', 'DA', 'DI', 'DOS', 'VAN', 'LA', 'LE']);
+// Sri Lankan style: every given name becomes an initial; the surname (with "DE", "DA"... ) stays.
+function initialsOf(fullName) {
+  const parts = String(fullName).replace(/\s+/g, ' ').trim().split(' ');
+  if (parts.length < 2) return parts.join(' ');
+  let cut = parts.length - 1;
+  while (cut > 1 && SURNAME_PARTICLES.has(parts[cut - 1].replace(/\./g, '').toUpperCase())) cut -= 1;
+  return [...parts.slice(0, cut).map((p) => `${p.replace(/\./g, '')[0]}.`), ...parts.slice(cut)].join(' ');
+}
+
+async function legacyValues(client, body) {
+  const v = parseFields(body, LEGACY_FIELDS);
+  const year = v.joined_year;
+  delete v.joined_year;
+  if (year > Number(M.today().slice(0, 4))) throw validationError('"Member since" cannot be a future year.');
+  v.joined_on = `${year}-01-01`;
+  v.full_name = v.full_name.replace(/\s+/g, ' ').trim();
+  v.name_with_initials = v.name_with_initials ? v.name_with_initials.replace(/\s+/g, ' ').trim() : initialsOf(v.full_name);
+  // Annual memberships without a date: valid to the end of this year.
+  if (v.category !== 'LT' && !v.valid_until) v.valid_until = `${M.today().slice(0, 4)}-12-31`;
+  return memberValues(client, { ...body, ...v, joined_on: v.joined_on, valid_until: v.valid_until || '' }, null, { legacy: true });
+}
+
+router.post('/members/legacy', form, async (req, res, next) => {
+  try {
+    const member = await withTransaction(async (client) => {
+      const values = await legacyValues(client, req.body);
+      const cols = Object.keys(values);
+      return (await client.query(
+        `INSERT INTO members (${cols.join(', ')}, source) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')}, 'legacy') RETURNING *`,
+        Object.values(values)
+      )).rows[0];
+    });
+    res.status(201).json(member);
+  } catch (err) {
+    next(err);
+  }
+});
 
 const memberPhotoUpload = (folderFn) => privateUpload(folderFn, { photo: 'image' });
 
@@ -588,7 +653,7 @@ router.put('/members/:id', memberPhotoUpload((req) => `membership/members/${pars
       return notFound(res, 'Member not found.');
     }
     const updated = await withTransaction(async (client) => {
-      const values = await memberValues(client, req.body, id);
+      const values = await memberValues(client, req.body, id, { legacy: existing.source === 'legacy' });
       const newPhoto = uploadedKey(req, 'photo');
       if (newPhoto) values.photo_key = newPhoto;
       const cols = Object.keys(values);
@@ -611,11 +676,15 @@ router.post('/members/:id/deactivate', form, async (req, res, next) => {
     const reason = String(req.body.reason || '').trim();
     if (!reason) throw validationError('Please give a reason for deactivating this member.');
     const row = (await pool.query(
-      'UPDATE members SET is_active = false, deactivated_reason = $1, deactivated_at = now(), updated_at = now() WHERE id = $2 RETURNING id',
+      'UPDATE members SET is_active = false, deactivated_reason = $1, deactivated_at = now(), updated_at = now() WHERE id = $2 RETURNING *',
       [reason, parseId(req.params.id)]
     )).rows[0];
     if (!row) return notFound(res, 'Member not found.');
-    res.json({ success: true });
+    // The member is told only if the admin chose to (e.g. not for a duplicate record); the secretary always is.
+    const notify = req.body.notify_member === 'true' && Boolean(row.email);
+    if (notify) sendMailInBackground(emails.memberDeactivated(row));
+    sendMailInBackground(emails.secretaryMemberStatus(row, { active: false, by: req.user.username, reason, memberEmailed: notify }));
+    res.json({ success: true, member_emailed: notify });
   } catch (err) {
     next(err);
   }
@@ -870,8 +939,13 @@ router.post('/members/:id/reactivate', form, async (req, res, next) => {
       if (!row) throw Object.assign(new Error('Member not found.'), { statusCode: 404 });
       return values ? recordPayment(client, row, values, settings, req.user.id) : null;
     });
-    if (result) paymentEmails(result, req.user.username);
-    res.json({ success: true, ...(result || {}) });
+    // One email to the member (reactivated, with the renewal if one was recorded) and one to the secretary.
+    const member = result ? result.member : (await getMember(parseId(req.params.id)));
+    const request = result ? result.request : null;
+    const notify = Boolean(member.email);
+    if (notify) sendMailInBackground(emails.memberReactivated(member, request));
+    sendMailInBackground(emails.secretaryMemberStatus(member, { active: true, by: req.user.username, request, memberEmailed: notify }));
+    res.json({ success: true, member_emailed: notify, ...(result || {}) });
   } catch (err) {
     next(err);
   }

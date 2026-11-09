@@ -16,6 +16,9 @@ const { parseFields, parseId, validationError } = require('../lib/crud');
 const { privateUpload, uploadedKey, discardUploads } = require('../lib/private-files');
 const { sendMailInBackground } = require('../lib/mail');
 const emails = require('../lib/event-emails');
+const { syncSeats, usesSeats, seatsTaken } = require('../lib/event-seats');
+
+const SEATS_FULL = 'All seats for this event have been filled, so registration is closed for now.';
 
 const router = express.Router();
 
@@ -142,7 +145,7 @@ router.post(
     try {
       const event = await getEvent(parseId(req.params.id));
       if (!event || event.category !== 'cpd') throw Object.assign(new Error('Event not found.'), { statusCode: 404 });
-      if (!E.registrationOpen(event, M.today())) throw validationError('Registration for this event is not open.');
+      if (!E.registrationOpen(event, M.today())) throw validationError(event.seats_closed ? SEATS_FULL : 'Registration for this event is not open.');
 
       const values = parseFields(req.body, REGISTRATION_FIELDS);
       const foreign = req.body.registrant_type === 'foreign';
@@ -215,18 +218,34 @@ router.post(
       };
       const columns = Object.keys(row);
       let saved;
+      let seats = null;
+      // One registration at a time per event (row lock), so a seat limit with a hard stop is never overshot.
+      const client = await pool.connect();
       try {
-        saved = (await pool.query(
+        await client.query('BEGIN');
+        const locked = (await client.query('SELECT * FROM events WHERE id = $1 FOR UPDATE', [event.id])).rows[0];
+        if (locked.seats_closed) throw validationError(SEATS_FULL);
+        if (usesSeats(locked) && locked.seat_hard_stop && await seatsTaken(client, locked.id) >= Number(locked.seat_limit)) throw validationError(SEATS_FULL);
+        saved = (await client.query(
           `INSERT INTO event_registrations (${columns.join(', ')}) VALUES (${columns.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING *`,
           Object.values(row)
         )).rows[0];
+        seats = await syncSeats(client, locked, { afterRegistration: true });
+        await client.query('COMMIT');
       } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
         if (err.code !== '23505') throw err;
         const existing = (await pool.query(
           "SELECT reference_number FROM event_registrations WHERE event_id = $1 AND upper(nic_number) = $2 AND status <> 'rejected'",
           [event.id, values.nic_number]
         )).rows[0];
         throw Object.assign(new Error(`This ${foreign ? 'passport number' : 'NIC'} is already registered for this event${existing ? ` (reference ${existing.reference_number})` : ''}.`), { statusCode: 409 });
+      } finally {
+        client.release();
+      }
+      // 80 / 95 / 100 % of the seats, or closed automatically: tell the secretary.
+      if (seats && (seats.alert || seats.closedNow)) {
+        sendMailInBackground(emails.secretarySeatAlert(seats.event, seats.taken, seats.alert || 100, seats.closedNow));
       }
 
       sendMailInBackground(emails.registrationReceived(saved));

@@ -36,6 +36,7 @@ const { deletePrivateFile, sendPrivateFile, PRIVATE_ROOT } = require('../lib/pri
 const { sendMailInBackground } = require('../lib/mail');
 const { COLUMNS: EXPORT_COLUMNS, STATUS_LABELS, sortForExport, writeRegistrationsPdf } = require('../lib/registrations-pdf');
 const emails = require('../lib/event-emails');
+const { syncSeats, usesSeats, seatsTaken } = require('../lib/event-seats');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -108,6 +109,8 @@ const EVENT_FIELDS = {
   foreign_physical: { type: 'enum', label: 'Foreign participants physical', values: ['true', 'false'], default: 'false' },
   foreign_fee_online: { ...money, label: 'Foreign participant fee (online)' },
   foreign_fee_physical: { ...money, label: 'Foreign participant fee (physical)' },
+  seat_limit: { type: 'int', label: 'Number of seats', min: 1, max: 100000 },
+  seat_hard_stop: { type: 'enum', label: 'Close when full', values: ['true', 'false'], default: 'false' },
 };
 const FEE_COLUMNS = ['member_fee', 'fee_lt', 'fee_gm', 'fee_om', 'fee_pm', 'non_member_fee'];
 
@@ -170,6 +173,11 @@ function eventValues(body) {
     if (!v[on] || v.fee_type !== 'paid') v[fee] = null;
     else if (v[fee] === null) throw validationError(`Please enter the fee for foreign participants attending ${mode} (USD; enter 0 if it's free).`);
   });
+
+  // Seats: only for CPD events registered on this website; the hard stop needs a number.
+  v.seat_hard_stop = v.seat_hard_stop === 'true';
+  if (v.category !== 'cpd' || v.registration_mode !== 'online') v.seat_limit = null;
+  if (!v.seat_limit) v.seat_hard_stop = false;
   return v;
 }
 
@@ -250,7 +258,8 @@ async function saveEvent(req, res, next, existing) {
         Object.values(values)
       );
     oldFiles.forEach(deleteUpload);
-    res.status(existing ? 200 : 201).json(result.rows[0]);
+    const saved = await withLockedEvent(result.rows[0].id, (client, event) => syncSeats(client, event));
+    res.status(existing ? 200 : 201).json(saved.event);
   } catch (err) {
     discardEventUploads(req);
     next(err);
@@ -276,6 +285,51 @@ router.put('/events/:id', eventUpload, async (req, res, next) => {
 // Opens or closes registration without editing the whole event:
 // "Registration Opening Soon" -> open, and open -> closed. Upcoming CPD events only.
 const REGISTRATION_SWITCH = { open: 'opening_soon', closed: 'open' };
+
+// Runs fn(client, lockedEvent) in a transaction; returns its result.
+async function withLockedEvent(id, fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const event = (await client.query('SELECT * FROM events WHERE id = $1 FOR UPDATE', [id])).rows[0];
+    if (!event) throw Object.assign(new Error('Event not found.'), { statusCode: 404 });
+    const out = await fn(client, event);
+    await client.query('COMMIT');
+    return out;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Reopens an event closed because its seats were filled (or adds seats any time):
+// add = extra seats (0 or more); hard_stop = keep closing automatically at the new number.
+router.post('/events/:id/seats', form, async (req, res, next) => {
+  try {
+    const { add, hard_stop: hardStop } = parseFields(req.body, {
+      add: { type: 'int', label: 'Seats to add', min: 0, max: 10000, default: 0 },
+      hard_stop: { type: 'enum', label: 'Close when full', values: ['true', 'false'], default: 'false' },
+    });
+    const out = await withLockedEvent(parseId(req.params.id), async (client, event) => {
+      if (!usesSeats(event)) throw validationError('This event has no seat limit.');
+      const taken = await seatsTaken(client, event.id);
+      const limit = Number(event.seat_limit) + add;
+      if (hardStop === 'true' && limit <= taken) {
+        throw validationError(`${taken} seats are taken. Add at least ${taken - Number(event.seat_limit) + 1} seat${taken - Number(event.seat_limit) + 1 === 1 ? '' : 's'} to reopen, or untick "Close again when full".`);
+      }
+      const updated = (await client.query(
+        'UPDATE events SET seat_limit = $1, seat_hard_stop = $2, seats_closed = false, updated_at = now() WHERE id = $3 RETURNING *',
+        [limit, hardStop === 'true', event.id]
+      )).rows[0];
+      return syncSeats(client, updated);
+    });
+    res.json({ ...out.event, seats_taken: out.taken });
+  } catch (err) {
+    next(err);
+  }
+});
 
 router.patch('/events/:id/status', form, async (req, res, next) => {
   try {

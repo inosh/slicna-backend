@@ -194,6 +194,15 @@ ALTER TABLE public.events ADD COLUMN IF NOT EXISTS foreign_online boolean NOT NU
 ALTER TABLE public.events ADD COLUMN IF NOT EXISTS foreign_physical boolean NOT NULL DEFAULT false;
 ALTER TABLE public.events ADD COLUMN IF NOT EXISTS foreign_fee_online numeric(10,2);
 ALTER TABLE public.events ADD COLUMN IF NOT EXISTS foreign_fee_physical numeric(10,2);
+
+-- Seats (CPD events registered on this website), see lib/event-seats.js:
+-- seat_limit (null: no limit), seat_hard_stop (close automatically when full),
+-- seats_closed (closed by that; the admin reopens it), seat_alerts (80/95/100 %
+-- levels already emailed to the secretary).
+ALTER TABLE public.events ADD COLUMN IF NOT EXISTS seat_limit integer;
+ALTER TABLE public.events ADD COLUMN IF NOT EXISTS seat_hard_stop boolean NOT NULL DEFAULT false;
+ALTER TABLE public.events ADD COLUMN IF NOT EXISTS seats_closed boolean NOT NULL DEFAULT false;
+ALTER TABLE public.events ADD COLUMN IF NOT EXISTS seat_alerts integer[] NOT NULL DEFAULT '{}';
 -- Events saved with an end date before durations existed become a number of days.
 UPDATE public.events SET duration_number = (end_date - event_date) + 1, duration_unit = 'day', end_date = NULL
 WHERE end_date IS NOT NULL AND end_date > event_date AND duration_number = 1 AND (end_date - event_date) < 366;
@@ -514,6 +523,13 @@ CREATE TABLE IF NOT EXISTS public.members
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS members_nic_key ON public.members (upper(nic_number));
+
+-- Legacy members: from the records kept before the website (number, name and
+-- dates only). Their NIC and contact details are added later: by an admin, or
+-- from their first renewal (a verified renewal copies email / mobile / workplace).
+ALTER TABLE public.members ALTER COLUMN nic_number DROP NOT NULL;
+ALTER TABLE public.members DROP CONSTRAINT IF EXISTS members_source_check;
+ALTER TABLE public.members ADD CONSTRAINT members_source_check CHECK (source IN ('application', 'manual', 'legacy'));
 
 -- Who confirmed the ID card application (added Nov 2026).
 ALTER TABLE public.members ADD COLUMN IF NOT EXISTS id_application_created_by integer;
