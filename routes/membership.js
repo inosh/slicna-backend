@@ -15,7 +15,7 @@ const rateLimit = require('express-rate-limit');
 const pool = require('../db/pool');
 const M = require('../lib/membership');
 const { parseFields, validationError } = require('../lib/crud');
-const { privateUpload, uploadedKey, discardUploads, PRIVATE_ROOT } = require('../lib/private-files');
+const { privateUpload, uploadedKey, discardUploads, deletePrivateFolder, movePrivateFolder } = require('../lib/private-files');
 const { sendMailInBackground } = require('../lib/mail');
 const emails = require('../lib/membership-emails');
 
@@ -113,11 +113,11 @@ function assignReference(req, res, next) {
   next();
 }
 
-const APPLICATIONS_DIR = path.join(PRIVATE_ROOT, 'membership', 'applications');
+const APPLICATIONS = 'membership/applications';
 
 // Moves the uploads to the reference's folder; returns the new file keys.
-function moveUploadsTo(req, reference) {
-  fs.renameSync(path.join(APPLICATIONS_DIR, `upload-${req.referenceCode}`), path.join(APPLICATIONS_DIR, reference));
+async function moveUploadsTo(req, reference) {
+  await movePrivateFolder(`${APPLICATIONS}/upload-${req.referenceCode}`, `${APPLICATIONS}/${reference}`);
   const rekey = (key) => key.replace(`membership/applications/upload-${req.referenceCode}/`, `membership/applications/${reference}/`);
   return { photo_key: rekey(uploadedKey(req, 'photo')), receipt_key: rekey(uploadedKey(req, 'receipt')) };
 }
@@ -167,7 +167,7 @@ router.post(
 
       const fees = await M.loadFees();
       reference = referenceFor(category, req.referenceCode);
-      const files = moveUploadsTo(req, reference);
+      const files = await moveUploadsTo(req, reference);
       const row = {
         ...values,
         reference_number: reference,
@@ -187,8 +187,8 @@ router.post(
       res.status(201).json({ reference_number: app.reference_number, category: app.category, status: app.status });
     } catch (err) {
       discardUploads(req);
-      fs.rm(path.join(APPLICATIONS_DIR, `upload-${req.referenceCode}`), { recursive: true, force: true }, () => {});
-      if (reference) fs.rm(path.join(APPLICATIONS_DIR, reference), { recursive: true, force: true }, () => {});
+      deletePrivateFolder(`${APPLICATIONS}/upload-${req.referenceCode}`);
+      if (reference) deletePrivateFolder(`${APPLICATIONS}/${reference}`);
       next(err);
     }
   }

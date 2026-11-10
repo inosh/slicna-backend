@@ -22,6 +22,8 @@ const albumsRoutes = require('./routes/albums');
 const membershipRoutes = require('./routes/membership');
 const membershipAdminRoutes = require('./routes/membership-admin');
 
+const storage = require('./lib/storage');
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -52,8 +54,14 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Uploaded images live on local disk for now (to be moved to Cloudflare R2).
-app.use('/uploads', express.static(path.join(__dirname, 'uploads'), { maxAge: '7d', fallthrough: false }));
+// Uploaded files live in the public R2 bucket. The database stores "/uploads/<key>";
+// the website loads R2 directly, and this keeps older /uploads links working.
+app.get('/uploads/*', (req, res) => {
+  const key = storage.publicKeyFromPath(decodeURIComponent(req.path));
+  if (!key) return res.status(404).json({ error: 'Not found.' });
+  res.set('Cache-Control', 'public, max-age=86400');
+  res.redirect(302, storage.publicUrl(key.split('/').map(encodeURIComponent).join('/')));
+});
 
 // --- Routes ---
 app.use('/api/auth', authRoutes);
@@ -98,7 +106,6 @@ app.use((err, req, res, next) => {
 app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
 
-  // Missing /uploads files arrive here from express.static (fallthrough: false).
   if (err.status === 404 || err.statusCode === 404) return res.status(404).json({ error: 'Not found.' });
 
   const statusCode = err.statusCode || 500;
@@ -109,6 +116,8 @@ app.use((err, req, res, next) => {
       : err.message,
   });
 });
+
+if (storage.missing.length) console.warn(`[storage] File uploads will fail: missing ${storage.missing.join(', ')}.`);
 
 app.listen(PORT, () => {
   console.log(`\nSLICNA backend API running at http://localhost:${PORT}`);

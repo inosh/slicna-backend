@@ -10,20 +10,18 @@
 const fs = require('fs');
 const path = require('path');
 const pool = require('./pool');
-const { UPLOAD_ROOT } = require('../middleware/upload');
+const storage = require('../lib/storage');
 
 const SEED_IMAGES = path.join(__dirname, 'seed-images');
 // Membership tables are never touched by seeding.
 const CONTENT_TABLES = ['milestones', 'committee_settings', 'committee_members', 'events', 'news', 'album_photos', 'albums', 'community_items', 'community_sections'];
 const UPLOAD_FOLDERS = ['about', 'committee', 'events', 'news', 'albums', 'community'];
 
-// Copies a seed image into uploads/<folder>/ and returns its public path.
-function upload(folder, seedFile) {
-  const dir = path.join(UPLOAD_ROOT, folder);
-  fs.mkdirSync(dir, { recursive: true });
-  const name = 'seed-' + path.basename(seedFile);
-  fs.copyFileSync(path.join(SEED_IMAGES, seedFile), path.join(dir, name));
-  return `/uploads/${folder}/${name}`;
+// Uploads a seed image to the public bucket (<folder>/seed-<name>) and returns its public path.
+async function upload(folder, seedFile) {
+  const key = `${folder}/seed-${path.basename(seedFile)}`;
+  await storage.put('public', key, fs.readFileSync(path.join(SEED_IMAGES, seedFile)), storage.contentTypeFor(seedFile));
+  return `/uploads/${key}`;
 }
 
 async function insert(client, table, row) {
@@ -36,7 +34,7 @@ async function insert(client, table, row) {
 }
 
 async function seed(client) {
-  await insert(client, 'site_settings', { key: 'about_journey_photo', value: upload('about', 'award-ceremony.jpg') });
+  await insert(client, 'site_settings', { key: 'about_journey_photo', value: await upload('about', 'award-ceremony.jpg') });
 
   const milestones = [
     ['2022', 'SLICNA is founded', 'ICU nurses come together to form a national association for critical care nursing.'],
@@ -62,7 +60,7 @@ async function seed(client) {
     ['Media Secretary', 'K.S.C. Dissanayaka', 'media-secretary.jpg'],
   ];
   for (const [i, [role_title, name, photo]] of members.entries()) {
-    await insert(client, 'committee_members', { role_title, name, display_order: (i + 1) * 10, photo_url: upload('committee', 'committee/' + photo) });
+    await insert(client, 'committee_members', { role_title, name, display_order: (i + 1) * 10, photo_url: await upload('committee', 'committee/' + photo) });
   }
 
   const events = [
@@ -79,7 +77,7 @@ async function seed(client) {
     { title: 'Cyber Security – Practical Workshop', category: 'cpd', event_date: '2026-11-28', location: 'To be announced', summary: 'A hands-on CPD workshop on staying safe with patient data, devices and online accounts.' },
   ];
   for (const { photo, ...event } of events) {
-    await insert(client, 'events', { ...event, photo_url: photo ? upload('events', photo) : null });
+    await insert(client, 'events', { ...event, photo_url: photo ? await upload('events', photo) : null });
   }
 
   const news = [
@@ -90,7 +88,7 @@ async function seed(client) {
     { title: 'On air: SLICNA nurses talk health on national radio', published_at: '2026-06-02', photo: 'radio-awareness.jpg', summary: 'Our members joined radio programmes to share practical health advice with the public.', body: 'SLICNA members have taken part in radio health programmes, sharing practical advice on preventing illness and recognising warning signs early.' },
   ];
   for (const { photo, ...item } of news) {
-    await insert(client, 'news', { ...item, photo_url: upload('news', photo) });
+    await insert(client, 'news', { ...item, photo_url: await upload('news', photo) });
   }
 
   const albums = [
@@ -102,7 +100,7 @@ async function seed(client) {
   for (const [i, [title, photos]] of albums.entries()) {
     const album = await insert(client, 'albums', { title, display_order: (i + 1) * 10 });
     for (const [j, [file, caption]] of photos.entries()) {
-      await insert(client, 'album_photos', { album_id: album.id, url: upload('albums', file), caption, display_order: (j + 1) * 10 });
+      await insert(client, 'album_photos', { album_id: album.id, url: await upload('albums', file), caption, display_order: (j + 1) * 10 });
     }
   }
 
@@ -111,18 +109,18 @@ async function seed(client) {
     title: 'අකුරට සවිය: first-minute skills for students',
     body: 'Our nurses visit schools to teach emergency response and first aid, and to talk about healthy habits. Students practise hands-on skills and receive certificates for taking part.',
     bullet_points: 'Emergency response and basic first aid\nRecognising when someone needs urgent help\nHealthy lifestyle and prevention',
-    logo_url: upload('community', 'school-health-logo.png'),
+    logo_url: await upload('community', 'school-health-logo.png'),
   });
   const schoolPhotos = [['school-health.jpg', 'Students practising first aid'], ['school-1.jpg', 'Nurse demonstrating first aid on a student'], ['school-2.jpg', 'Student receiving a certificate']];
   for (const [i, [file, title]] of schoolPhotos.entries()) {
-    await insert(client, 'community_items', { section_id: school.id, display_order: (i + 1) * 10, image_url: upload('community', file), title });
+    await insert(client, 'community_items', { section_id: school.id, display_order: (i + 1) * 10, image_url: await upload('community', file), title });
   }
 
   const radio = await insert(client, 'community_sections', {
     display_order: 20, style: 'highlight', eyebrow: 'On air', title: 'Health talks on national radio',
     body: 'SLICNA nurses take part in radio health programmes such as සුව දිවිය. They give clear, practical advice on preventing illness and spotting warning signs early.',
   });
-  await insert(client, 'community_items', { section_id: radio.id, display_order: 10, image_url: upload('community', 'radio-awareness.jpg'), title: 'SLICNA nurses during a radio health programme' });
+  await insert(client, 'community_items', { section_id: radio.id, display_order: 10, image_url: await upload('community', 'radio-awareness.jpg'), title: 'SLICNA nurses during a radio health programme' });
 
   const campaigns = await insert(client, 'community_sections', {
     display_order: 30, style: 'cards', eyebrow: 'Campaigns', title: 'Public awareness campaigns',
@@ -134,7 +132,7 @@ async function seed(client) {
     ['childrens-day.jpg', "Children's Day", 'Programmes for children', 'Health promotion at community celebrations for children and families.'],
   ];
   for (const [i, [file, label, title, text]] of cards.entries()) {
-    await insert(client, 'community_items', { section_id: campaigns.id, display_order: (i + 1) * 10, image_url: upload('community', file), label, title, text });
+    await insert(client, 'community_items', { section_id: campaigns.id, display_order: (i + 1) * 10, image_url: await upload('community', file), label, title, text });
   }
 }
 
@@ -145,7 +143,7 @@ async function main() {
     if (reset) {
       await client.query(`TRUNCATE ${CONTENT_TABLES.join(', ')} RESTART IDENTITY CASCADE`);
       await client.query("DELETE FROM site_settings WHERE key = 'about_journey_photo'");
-      UPLOAD_FOLDERS.forEach((folder) => fs.rmSync(path.join(UPLOAD_ROOT, folder), { recursive: true, force: true }));
+      for (const folder of UPLOAD_FOLDERS) await storage.removePrefix('public', `${folder}/seed-`);
       console.log('Existing content and uploaded files removed.');
     } else {
       const hasAboutPhoto = (await client.query("SELECT 1 FROM site_settings WHERE key = 'about_journey_photo'")).rows[0];

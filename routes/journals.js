@@ -14,8 +14,8 @@ const express = require('express');
 const multer = require('multer');
 const pool = require('../db/pool');
 const { requireAuth } = require('../middleware/auth');
-const { UPLOAD_ROOT } = require('../middleware/upload');
-const { deleteUpload } = require('../lib/files');
+const { storageFor } = require('../middleware/upload');
+const { deleteUpload, discardRequestFiles } = require('../lib/files');
 const { parseFields, parseId, validationError } = require('../lib/crud');
 
 const router = express.Router();
@@ -26,16 +26,7 @@ const TYPES = {
   cover: ['image/jpeg', 'image/png', 'image/webp'],
 };
 const upload = multer({
-  storage: multer.diskStorage({
-    destination(req, file, cb) {
-      const dir = path.join(UPLOAD_ROOT, 'journals');
-      fs.mkdirSync(dir, { recursive: true });
-      cb(null, dir);
-    },
-    filename(req, file, cb) {
-      cb(null, `${Date.now()}-${crypto.randomBytes(4).toString('hex')}-${file.originalname.replace(/[^a-zA-Z0-9.\-_]/g, '_').slice(-80)}`);
-    },
-  }),
+  storage: storageFor('journals'), // the public R2 bucket, journals/...
   fileFilter(req, file, cb) {
     const types = TYPES[file.fieldname];
     if (!types) return cb(new Error('Unexpected upload field: ' + file.fieldname + '. Only listed files are allowed.'));
@@ -48,7 +39,7 @@ const upload = multer({
 }).fields([{ name: 'pdf', maxCount: 1 }, { name: 'cover', maxCount: 1 }]);
 
 const uploaded = (req, field) => (req.files && req.files[field] ? req.files[field][0] : null);
-const discard = (req) => Object.values(req.files || {}).flat().forEach((f) => fs.unlink(f.path, () => {}));
+const discard = discardRequestFiles;
 const publicPath = (file) => `/uploads/journals/${file.filename}`;
 
 const FIELDS = {

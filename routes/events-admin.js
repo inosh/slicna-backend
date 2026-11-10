@@ -29,10 +29,10 @@ const pool = require('../db/pool');
 const M = require('../lib/membership');
 const E = require('../lib/events');
 const { requireAuth } = require('../middleware/auth');
-const { UPLOAD_ROOT } = require('../middleware/upload');
-const { deleteUpload } = require('../lib/files');
+const { storageFor } = require('../middleware/upload');
+const { deleteUpload, discardRequestFiles } = require('../lib/files');
 const { parseFields, parseId, validationError } = require('../lib/crud');
-const { deletePrivateFile, sendPrivateFile, PRIVATE_ROOT } = require('../lib/private-files');
+const { deletePrivateFile, deletePrivateFolder, sendPrivateFile } = require('../lib/private-files');
 const { sendMailInBackground } = require('../lib/mail');
 const { COLUMNS: EXPORT_COLUMNS, STATUS_LABELS, sortForExport, writeRegistrationsPdf } = require('../lib/registrations-pdf');
 const emails = require('../lib/event-emails');
@@ -50,16 +50,7 @@ const UPLOAD_TYPES = {
   attachment: ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'],
 };
 const eventUpload = multer({
-  storage: multer.diskStorage({
-    destination(req, file, cb) {
-      const dir = path.join(UPLOAD_ROOT, 'events');
-      fs.mkdirSync(dir, { recursive: true });
-      cb(null, dir);
-    },
-    filename(req, file, cb) {
-      cb(null, `${Date.now()}-${crypto.randomBytes(4).toString('hex')}-${file.originalname.replace(/[^a-zA-Z0-9.\-_]/g, '_').slice(-80)}`);
-    },
-  }),
+  storage: storageFor('events'), // the public R2 bucket, events/...
   fileFilter(req, file, cb) {
     const types = UPLOAD_TYPES[file.fieldname];
     if (!types) return cb(Object.assign(new Error('Unexpected upload field: ' + file.fieldname + '. Only listed files are allowed.'), { statusCode: 400 }));
@@ -72,7 +63,7 @@ const eventUpload = multer({
 }).fields([{ name: 'photo', maxCount: 1 }, { name: 'attachment', maxCount: 1 }]);
 
 const uploaded = (req, field) => (req.files && req.files[field] ? req.files[field][0] : null);
-const discardEventUploads = (req) => Object.values(req.files || {}).flat().forEach((f) => fs.unlink(f.path, () => {}));
+const discardEventUploads = discardRequestFiles;
 
 // ---------- Event fields ----------
 
@@ -464,7 +455,7 @@ router.delete('/registrations/:id', async (req, res, next) => {
     const reg = (await pool.query('DELETE FROM event_registrations WHERE id = $1 RETURNING *', [parseId(req.params.id)])).rows[0];
     if (!reg) return notFound(res, 'Registration not found.');
     if (reg.receipt_key) deletePrivateFile(reg.receipt_key);
-    fs.rm(path.join(PRIVATE_ROOT, 'events', String(reg.event_id), 'registrations', reg.reference_number), { recursive: true, force: true }, () => {});
+    deletePrivateFolder(`events/${reg.event_id}/registrations/${reg.reference_number}`);
     res.json({ success: true });
   } catch (err) {
     next(err);
