@@ -1,16 +1,13 @@
 // middleware/upload.js
-// Multer config for image (and album video) uploads, saved to the local uploads/ folder:
-//   uploads/<folder>/<timestamp>-<random>-<original-name>
-// The database stores the public path ("/uploads/<folder>/<file>"), which
-// server.js serves as static files. (To move to Cloudflare R2 later, only this
-// file and lib/files.js need to change.)
+// Multer config for public uploads (photos, album videos, posters, PDFs),
+// streamed straight to the public R2 bucket (lib/storage.js) as
+//   <folder>/<timestamp>-<random>-<original-name>
+// The database stores the public path "/uploads/<folder>/<file>" (as before
+// R2), which the website turns into the R2 address.
 
-const fs = require('fs');
-const path = require('path');
 const crypto = require('crypto');
 const multer = require('multer');
-
-const UPLOAD_ROOT = path.join(__dirname, '..', 'uploads');
+const storage = require('../lib/storage');
 const IMAGE_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
 // Album videos, as on the SLNA site.
 const VIDEO_MIME_TYPES = ['video/mp4', 'video/webm', 'video/quicktime', 'video/ogg', 'video/x-m4v'];
@@ -26,17 +23,9 @@ function safeName(originalname) {
   return originalname.replace(/[^a-zA-Z0-9.\-_]/g, '_').slice(-80);
 }
 
+// Multer storage for a folder of the public bucket.
 function storageFor(folder) {
-  return multer.diskStorage({
-    destination(req, file, cb) {
-      const dir = path.join(UPLOAD_ROOT, folder);
-      fs.mkdirSync(dir, { recursive: true });
-      cb(null, dir);
-    },
-    filename(req, file, cb) {
-      cb(null, `${Date.now()}-${crypto.randomBytes(4).toString('hex')}-${safeName(file.originalname)}`);
-    },
-  });
+  return storage.multerStorage('public', (req, file) => `${folder}/${Date.now()}-${crypto.randomBytes(4).toString('hex')}-${safeName(file.originalname)}`);
 }
 
 function imageFilter(req, file, cb) {
@@ -82,4 +71,4 @@ function publicPathFor(folder, file) {
   return `/uploads/${folder}/${file.filename}`;
 }
 
-module.exports = { UPLOAD_ROOT, imageUpload, mediaUpload, mediaTypeFor, checkMediaSizes, publicPathFor };
+module.exports = { storageFor, imageUpload, mediaUpload, mediaTypeFor, checkMediaSizes, publicPathFor, MAX_IMAGE_BYTES };

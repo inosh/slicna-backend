@@ -46,7 +46,8 @@ const pool = require('../db/pool');
 const M = require('../lib/membership');
 const { requireAuth } = require('../middleware/auth');
 const { parseFields, parseId, validationError } = require('../lib/crud');
-const { privateUpload, uploadedKey, discardUploads, deletePrivateFile, sendPrivateFile, PRIVATE_ROOT } = require('../lib/private-files');
+const { privateUpload, uploadedKey, discardUploads, deletePrivateFile, deletePrivateFolder, privateFileBuffer, sendPrivateFile } = require('../lib/private-files');
+const storage = require('../lib/storage');
 const { sendMail, sendMailInBackground, emailConfigured } = require('../lib/mail');
 const { runReminders } = require('../lib/reminders');
 const ExcelJS = require('exceljs');
@@ -290,7 +291,7 @@ router.delete('/applications/:id', async (req, res, next) => {
     if (app.status === 'approved') throw validationError('Approved applications cannot be deleted. Deactivate the member instead.');
     await pool.query('DELETE FROM membership_applications WHERE id = $1', [app.id]);
     [app.photo_key, app.receipt_key].forEach(deletePrivateFile);
-    fs.rm(path.join(PRIVATE_ROOT, 'membership', 'applications', app.reference_number), { recursive: true, force: true }, () => {});
+    deletePrivateFolder(`membership/applications/${app.reference_number}`);
     res.json({ success: true });
   } catch (err) {
     next(err);
@@ -321,7 +322,13 @@ async function sendIdApplicationPdf(req, res, member, app) {
   res.setHeader('Cache-Control', 'private, no-store');
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Content-Disposition', `attachment; filename="${idApplicationFilename(member)}"`);
-  writeIdApplicationPdf(res, member, app, { generatedBy: admin && admin.username });
+  let photo = null;
+  try {
+    photo = await privateFileBuffer(member.photo_key || (app && app.photo_key));
+  } catch (err) {
+    console.error('Could not read the photo for the ID application', err.message);
+  }
+  writeIdApplicationPdf(res, member, app, { generatedBy: admin && admin.username, photo });
 }
 
 function sendIdPhoto(res, member, app) {
@@ -628,10 +635,8 @@ router.post('/members', memberPhotoUpload(() => 'membership/members/new'), async
       // Move the photo into the member's own folder now that the id is known.
       const file = req.files && req.files.photo && req.files.photo[0];
       if (file) {
-        const key = `membership/members/${row.id}/${path.basename(file.path)}`;
-        const dest = path.join(PRIVATE_ROOT, key);
-        fs.mkdirSync(path.dirname(dest), { recursive: true });
-        fs.renameSync(file.path, dest);
+        const key = await storage.move('private', file.key, `membership/members/${row.id}/${file.filename}`);
+        file.key = key; // so a failure below removes the moved file
         await client.query('UPDATE members SET photo_key = $1 WHERE id = $2', [key, row.id]);
         row.photo_key = key;
       }
