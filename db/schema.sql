@@ -685,6 +685,32 @@ CREATE INDEX IF NOT EXISTS event_registrations_event_idx ON public.event_registr
 -- One live registration per person per event (a rejected one can be redone).
 CREATE UNIQUE INDEX IF NOT EXISTS event_registrations_once ON public.event_registrations (event_id, upper(nic_number)) WHERE status <> 'rejected';
 
+-- Table: public.contact_messages
+-- Messages from the website's Contact page (routes/contact.js). status: new ->
+-- read (opened or replied). admin_reply / replied_at / replied_by: the last
+-- reply emailed from the admin panel (sending again replaces it).
+
+CREATE TABLE IF NOT EXISTS public.contact_messages
+(
+    id serial NOT NULL,
+    full_name character varying(200) NOT NULL,
+    email character varying(255) NOT NULL,
+    phone character varying(30),
+    subject character varying(20) NOT NULL DEFAULT 'other',
+    message text NOT NULL,
+    status character varying(10) NOT NULL DEFAULT 'new',
+    admin_reply text,
+    replied_at timestamp with time zone,
+    replied_by integer,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT contact_messages_pkey PRIMARY KEY (id),
+    CONSTRAINT contact_messages_subject_check CHECK (subject IN ('membership', 'cpd', 'partnership', 'media', 'other')),
+    CONSTRAINT contact_messages_status_check CHECK (status IN ('new', 'read')),
+    CONSTRAINT contact_messages_replied_by_fkey FOREIGN KEY (replied_by) REFERENCES public.users (id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS contact_messages_created_idx ON public.contact_messages (created_at DESC);
+
 -- Table: public.retired_membership_numbers
 -- Numbers a member gave up (e.g. their GM number when upgrading to Lifetime).
 -- They are never suggested or assigned again, so old ID cards, letters and

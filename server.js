@@ -19,6 +19,7 @@ const committeeRoutes = require('./routes/committee');
 const settingsRoutes = require('./routes/settings');
 const communityRoutes = require('./routes/community');
 const albumsRoutes = require('./routes/albums');
+const contactRoutes = require('./routes/contact');
 const membershipRoutes = require('./routes/membership');
 const membershipAdminRoutes = require('./routes/membership-admin');
 
@@ -74,6 +75,7 @@ app.use('/api/committee', committeeRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/community', communityRoutes);
 app.use('/api/albums', albumsRoutes);
+app.use('/api/contact', contactRoutes);
 // Admin routes first: /api/membership/admin/* all require a login.
 app.use('/api/membership/admin', membershipAdminRoutes);
 app.use('/api/membership', membershipRoutes);
