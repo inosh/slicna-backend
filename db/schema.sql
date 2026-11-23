@@ -676,6 +676,10 @@ CREATE TABLE IF NOT EXISTS public.event_registrations
 
 ALTER TABLE public.event_registrations ADD COLUMN IF NOT EXISTS currency character varying(3) NOT NULL DEFAULT 'LKR';
 ALTER TABLE public.event_registrations ADD COLUMN IF NOT EXISTS country character varying(100);
+-- Designation (Nursing Officer Grade 03 … Student, Other) replaced Workplace address on the form;
+-- the old column stays for earlier registrations.
+ALTER TABLE public.event_registrations ADD COLUMN IF NOT EXISTS designation character varying(60);
+ALTER TABLE public.event_registrations ALTER COLUMN workplace_address DROP NOT NULL;
 ALTER TABLE public.event_registrations DROP CONSTRAINT IF EXISTS event_registrations_type_check;
 ALTER TABLE public.event_registrations ADD CONSTRAINT event_registrations_type_check CHECK (registrant_type IN ('member', 'non_member', 'foreign'));
 ALTER TABLE public.event_registrations DROP CONSTRAINT IF EXISTS event_registrations_fee_category_check;
