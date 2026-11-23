@@ -113,6 +113,9 @@ router.post('/:id/member-check', lookupLimiter, async (req, res, next) => {
 const REF_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const newReference = () => 'REG-' + [...crypto.randomBytes(8)].map((b) => REF_CHARS[b % REF_CHARS.length]).join('');
 
+// Designation on the registration form (it replaced Workplace address).
+const DESIGNATIONS = ['Nursing Officer Grade 03', 'Nursing Officer Grade 02', 'Nursing Officer Grade 01', 'Nursing Sister',
+  'Sp. Grade Nursing Officer', 'Nursing Tutor', 'Student', 'Other'];
 const REGISTRATION_FIELDS = {
   full_name: { type: 'text', label: 'Full name', required: true, max: 255 },
   certificate_name: { type: 'text', label: 'Name on the certificate', required: true, max: 255 },
@@ -123,7 +126,7 @@ const REGISTRATION_FIELDS = {
   mobile: { type: 'text', label: 'Mobile number', required: true, max: 30 },
   postal_address: { type: 'text', label: 'Postal address', required: true, max: 500 },
   workplace: { type: 'text', label: 'Workplace', required: true, max: 255 },
-  workplace_address: { type: 'text', label: 'Workplace address', required: true, max: 500 },
+  designation: { type: 'enum', label: 'Designation', required: true, values: DESIGNATIONS },
 };
 const PAYMENT_FIELDS = {
   pay_by: { type: 'enum', label: 'Paid by', required: true, values: ['individual', 'organisation'] },
